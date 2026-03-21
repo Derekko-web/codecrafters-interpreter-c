@@ -5,7 +5,9 @@
 char *read_file_contents(const char *filename);
 int scan_tokens(const char *source);
 void print_token(const char *type, const char *lexeme);
+void print_token_slices(const char *type, const char *lexeme, size_t lexeme_length, const char *literal, size_t literal_length);
 int match_next(const char *source, size_t *index, char expected);
+int scan_string(const char *source, size_t *index, int *line);
 
 int main(int argc, char *argv[]) {
     // Disable output buffering
@@ -149,6 +151,11 @@ int scan_tokens(const char *source) {
                     print_token("SLASH", "/");
                 }
                 break;
+            case '"':
+                if (scan_string(source, &i, &line)) {
+                    had_error = 1;
+                }
+                break;
             case ' ':
             case '\r':
             case '\t':
@@ -171,6 +178,10 @@ void print_token(const char *type, const char *lexeme) {
     printf("%s %s null\n", type, lexeme);
 }
 
+void print_token_slices(const char *type, const char *lexeme, size_t lexeme_length, const char *literal, size_t literal_length) {
+    printf("%s %.*s %.*s\n", type, (int)lexeme_length, lexeme, (int)literal_length, literal);
+}
+
 int match_next(const char *source, size_t *index, char expected) {
     if (source[*index + 1] != expected) {
         return 0;
@@ -178,4 +189,27 @@ int match_next(const char *source, size_t *index, char expected) {
 
     (*index)++;
     return 1;
+}
+
+int scan_string(const char *source, size_t *index, int *line) {
+    size_t start = *index;
+    size_t current = start + 1;
+
+    while (source[current] != '"' && source[current] != '\0') {
+        if (source[current] == '\n') {
+            (*line)++;
+        }
+
+        current++;
+    }
+
+    if (source[current] == '\0') {
+        fprintf(stderr, "[line %d] Error: Unterminated string.\n", *line);
+        *index = current - 1;
+        return 1;
+    }
+
+    print_token_slices("STRING", source + start, current - start + 1, source + start + 1, current - start - 1);
+    *index = current;
+    return 0;
 }
