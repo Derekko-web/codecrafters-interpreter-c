@@ -119,6 +119,13 @@ int scan_tokens(const char *source) {
                     print_token("EQUAL", "=");
                 }
                 break;
+            case '!':
+                if (match_next(source, &i, '=')) {
+                    print_token("BANG_EQUAL", "!=");
+                } else {
+                    print_token("BANG", "!");
+                }
+                break;
             case ' ':
             case '\r':
             case '\t':
