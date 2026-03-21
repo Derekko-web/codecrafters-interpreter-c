@@ -140,6 +140,15 @@ int scan_tokens(const char *source) {
                     print_token("GREATER", ">");
                 }
                 break;
+            case '/':
+                if (match_next(source, &i, '/')) {
+                    while (source[i + 1] != '\0' && source[i + 1] != '\n') {
+                        i++;
+                    }
+                } else {
+                    print_token("SLASH", "/");
+                }
+                break;
             case ' ':
             case '\r':
             case '\t':
