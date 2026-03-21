@@ -93,6 +93,24 @@ int scan_tokens(const char *source) {
             case '}':
                 print_token("RIGHT_BRACE", "}");
                 break;
+            case ',':
+                print_token("COMMA", ",");
+                break;
+            case '.':
+                print_token("DOT", ".");
+                break;
+            case '-':
+                print_token("MINUS", "-");
+                break;
+            case '+':
+                print_token("PLUS", "+");
+                break;
+            case ';':
+                print_token("SEMICOLON", ";");
+                break;
+            case '*':
+                print_token("STAR", "*");
+                break;
             case ' ':
             case '\r':
             case '\t':
