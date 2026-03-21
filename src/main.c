@@ -8,6 +8,9 @@ void print_token(const char *type, const char *lexeme);
 void print_token_slices(const char *type, const char *lexeme, size_t lexeme_length, const char *literal, size_t literal_length);
 int match_next(const char *source, size_t *index, char expected);
 int scan_string(const char *source, size_t *index, int *line);
+int scan_number(const char *source, size_t *index);
+int is_digit(char c);
+void format_number_literal(double value, char *buffer, size_t buffer_size);
 
 int main(int argc, char *argv[]) {
     // Disable output buffering
@@ -164,8 +167,12 @@ int scan_tokens(const char *source) {
                 line++;
                 break;
             default:
-                fprintf(stderr, "[line %d] Error: Unexpected character: %c\n", line, source[i]);
-                had_error = 1;
+                if (is_digit(source[i])) {
+                    scan_number(source, &i);
+                } else {
+                    fprintf(stderr, "[line %d] Error: Unexpected character: %c\n", line, source[i]);
+                    had_error = 1;
+                }
                 break;
         }
     }
@@ -212,4 +219,47 @@ int scan_string(const char *source, size_t *index, int *line) {
     print_token_slices("STRING", source + start, current - start + 1, source + start + 1, current - start - 1);
     *index = current;
     return 0;
+}
+
+int scan_number(const char *source, size_t *index) {
+    size_t start = *index;
+    size_t current = start;
+
+    while (is_digit(source[current + 1])) {
+        current++;
+    }
+
+    if (source[current + 1] == '.' && is_digit(source[current + 2])) {
+        current++;
+
+        while (is_digit(source[current + 1])) {
+            current++;
+        }
+    }
+
+    double value = strtod(source + start, NULL);
+    char literal[64];
+    format_number_literal(value, literal, sizeof(literal));
+
+    print_token_slices("NUMBER", source + start, current - start + 1, literal, strlen(literal));
+    *index = current;
+    return 0;
+}
+
+int is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+void format_number_literal(double value, char *buffer, size_t buffer_size) {
+    snprintf(buffer, buffer_size, "%.15g", value);
+
+    if (strchr(buffer, '.') == NULL && strchr(buffer, 'e') == NULL && strchr(buffer, 'E') == NULL) {
+        size_t length = strlen(buffer);
+
+        if (length + 2 < buffer_size) {
+            buffer[length] = '.';
+            buffer[length + 1] = '0';
+            buffer[length + 2] = '\0';
+        }
+    }
 }
