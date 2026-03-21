@@ -10,6 +10,7 @@ int match_next(const char *source, size_t *index, char expected);
 int scan_string(const char *source, size_t *index, int *line);
 int scan_number(const char *source, size_t *index);
 int scan_identifier(const char *source, size_t *index);
+const char *identifier_type(const char *start, size_t length);
 int is_digit(char c);
 int is_alpha(char c);
 int is_alphanumeric(char c);
@@ -259,9 +260,31 @@ int scan_identifier(const char *source, size_t *index) {
         current++;
     }
 
-    printf("IDENTIFIER %.*s null\n", (int)(current - start + 1), source + start);
+    size_t length = current - start + 1;
+    printf("%s %.*s null\n", identifier_type(source + start, length), (int)length, source + start);
     *index = current;
     return 0;
+}
+
+const char *identifier_type(const char *start, size_t length) {
+    if (length == 2 && strncmp(start, "if", 2) == 0) return "IF";
+    if (length == 2 && strncmp(start, "or", 2) == 0) return "OR";
+    if (length == 3 && strncmp(start, "and", 3) == 0) return "AND";
+    if (length == 3 && strncmp(start, "for", 3) == 0) return "FOR";
+    if (length == 3 && strncmp(start, "fun", 3) == 0) return "FUN";
+    if (length == 3 && strncmp(start, "nil", 3) == 0) return "NIL";
+    if (length == 3 && strncmp(start, "var", 3) == 0) return "VAR";
+    if (length == 4 && strncmp(start, "else", 4) == 0) return "ELSE";
+    if (length == 5 && strncmp(start, "false", 5) == 0) return "FALSE";
+    if (length == 4 && strncmp(start, "true", 4) == 0) return "TRUE";
+    if (length == 4 && strncmp(start, "this", 4) == 0) return "THIS";
+    if (length == 5 && strncmp(start, "class", 5) == 0) return "CLASS";
+    if (length == 5 && strncmp(start, "print", 5) == 0) return "PRINT";
+    if (length == 5 && strncmp(start, "super", 5) == 0) return "SUPER";
+    if (length == 5 && strncmp(start, "while", 5) == 0) return "WHILE";
+    if (length == 6 && strncmp(start, "return", 6) == 0) return "RETURN";
+
+    return "IDENTIFIER";
 }
 
 int is_digit(char c) {
