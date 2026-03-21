@@ -9,7 +9,10 @@ void print_token_slices(const char *type, const char *lexeme, size_t lexeme_leng
 int match_next(const char *source, size_t *index, char expected);
 int scan_string(const char *source, size_t *index, int *line);
 int scan_number(const char *source, size_t *index);
+int scan_identifier(const char *source, size_t *index);
 int is_digit(char c);
+int is_alpha(char c);
+int is_alphanumeric(char c);
 void format_number_literal(double value, char *buffer, size_t buffer_size);
 
 int main(int argc, char *argv[]) {
@@ -169,6 +172,8 @@ int scan_tokens(const char *source) {
             default:
                 if (is_digit(source[i])) {
                     scan_number(source, &i);
+                } else if (is_alpha(source[i])) {
+                    scan_identifier(source, &i);
                 } else {
                     fprintf(stderr, "[line %d] Error: Unexpected character: %c\n", line, source[i]);
                     had_error = 1;
@@ -246,8 +251,29 @@ int scan_number(const char *source, size_t *index) {
     return 0;
 }
 
+int scan_identifier(const char *source, size_t *index) {
+    size_t start = *index;
+    size_t current = start;
+
+    while (is_alphanumeric(source[current + 1])) {
+        current++;
+    }
+
+    printf("IDENTIFIER %.*s null\n", (int)(current - start + 1), source + start);
+    *index = current;
+    return 0;
+}
+
 int is_digit(char c) {
     return c >= '0' && c <= '9';
+}
+
+int is_alpha(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+int is_alphanumeric(char c) {
+    return is_alpha(c) || is_digit(c);
 }
 
 void format_number_literal(double value, char *buffer, size_t buffer_size) {
