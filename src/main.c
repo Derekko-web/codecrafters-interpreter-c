@@ -126,6 +126,20 @@ int scan_tokens(const char *source) {
                     print_token("BANG", "!");
                 }
                 break;
+            case '<':
+                if (match_next(source, &i, '=')) {
+                    print_token("LESS_EQUAL", "<=");
+                } else {
+                    print_token("LESS", "<");
+                }
+                break;
+            case '>':
+                if (match_next(source, &i, '=')) {
+                    print_token("GREATER_EQUAL", ">=");
+                } else {
+                    print_token("GREATER", ">");
+                }
+                break;
             case ' ':
             case '\r':
             case '\t':
