@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(codecrafters-interpreter)
+project(codecrafters-interpreter LANGUAGES C)
 
 file(GLOB_RECURSE SOURCE_FILES src/*.c src/*.h)
 
