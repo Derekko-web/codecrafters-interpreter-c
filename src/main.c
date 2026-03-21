@@ -5,6 +5,7 @@
 char *read_file_contents(const char *filename);
 int scan_tokens(const char *source);
 void print_token(const char *type, const char *lexeme);
+int match_next(const char *source, size_t *index, char expected);
 
 int main(int argc, char *argv[]) {
     // Disable output buffering
@@ -111,6 +112,13 @@ int scan_tokens(const char *source) {
             case '*':
                 print_token("STAR", "*");
                 break;
+            case '=':
+                if (match_next(source, &i, '=')) {
+                    print_token("EQUAL_EQUAL", "==");
+                } else {
+                    print_token("EQUAL", "=");
+                }
+                break;
             case ' ':
             case '\r':
             case '\t':
@@ -131,4 +139,13 @@ int scan_tokens(const char *source) {
 
 void print_token(const char *type, const char *lexeme) {
     printf("%s %s null\n", type, lexeme);
+}
+
+int match_next(const char *source, size_t *index, char expected) {
+    if (source[*index + 1] != expected) {
+        return 0;
+    }
+
+    (*index)++;
+    return 1;
 }
