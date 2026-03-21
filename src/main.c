@@ -87,6 +87,12 @@ int scan_tokens(const char *source) {
             case ')':
                 print_token("RIGHT_PAREN", ")");
                 break;
+            case '{':
+                print_token("LEFT_BRACE", "{");
+                break;
+            case '}':
+                print_token("RIGHT_BRACE", "}");
+                break;
             case ' ':
             case '\r':
             case '\t':
