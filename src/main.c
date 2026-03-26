@@ -2,46 +2,254 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef enum {
+    TOKEN_LEFT_PAREN,
+    TOKEN_RIGHT_PAREN,
+    TOKEN_LEFT_BRACE,
+    TOKEN_RIGHT_BRACE,
+    TOKEN_COMMA,
+    TOKEN_DOT,
+    TOKEN_MINUS,
+    TOKEN_PLUS,
+    TOKEN_SEMICOLON,
+    TOKEN_SLASH,
+    TOKEN_STAR,
+    TOKEN_BANG,
+    TOKEN_BANG_EQUAL,
+    TOKEN_EQUAL,
+    TOKEN_EQUAL_EQUAL,
+    TOKEN_GREATER,
+    TOKEN_GREATER_EQUAL,
+    TOKEN_LESS,
+    TOKEN_LESS_EQUAL,
+    TOKEN_IDENTIFIER,
+    TOKEN_STRING,
+    TOKEN_NUMBER,
+    TOKEN_AND,
+    TOKEN_CLASS,
+    TOKEN_ELSE,
+    TOKEN_FALSE,
+    TOKEN_FOR,
+    TOKEN_FUN,
+    TOKEN_IF,
+    TOKEN_NIL,
+    TOKEN_OR,
+    TOKEN_PRINT,
+    TOKEN_RETURN,
+    TOKEN_SUPER,
+    TOKEN_THIS,
+    TOKEN_TRUE,
+    TOKEN_VAR,
+    TOKEN_WHILE,
+    TOKEN_EOF
+} TokenType;
+
+typedef struct {
+    TokenType type;
+    const char *start;
+    size_t length;
+    int line;
+    double number;
+} Token;
+
+typedef struct {
+    Token *items;
+    size_t count;
+    size_t capacity;
+} TokenArray;
+
+typedef struct {
+    const char *source;
+    size_t start;
+    size_t current;
+    int line;
+    int had_error;
+    TokenArray tokens;
+} Scanner;
+
+typedef enum {
+    EXPR_BINARY,
+    EXPR_GROUPING,
+    EXPR_LITERAL,
+    EXPR_UNARY
+} ExprType;
+
+typedef enum {
+    LITERAL_NIL,
+    LITERAL_BOOL,
+    LITERAL_NUMBER,
+    LITERAL_STRING
+} LiteralType;
+
+typedef struct Expr Expr;
+
+struct Expr {
+    ExprType type;
+    union {
+        struct {
+            Expr *left;
+            Token operator_token;
+            Expr *right;
+        } binary;
+        struct {
+            Expr *expression;
+        } grouping;
+        struct {
+            LiteralType type;
+            int boolean;
+            double number;
+            const char *string_start;
+            size_t string_length;
+        } literal;
+        struct {
+            Token operator_token;
+            Expr *right;
+        } unary;
+    } as;
+};
+
+typedef struct {
+    TokenArray *tokens;
+    size_t current;
+    int had_error;
+} Parser;
+
 char *read_file_contents(const char *filename);
-int scan_tokens(const char *source);
-void print_token(const char *type, const char *lexeme);
-void print_token_slices(const char *type, const char *lexeme, size_t lexeme_length, const char *literal, size_t literal_length);
-int match_next(const char *source, size_t *index, char expected);
-int scan_string(const char *source, size_t *index, int *line);
-int scan_number(const char *source, size_t *index);
-int scan_identifier(const char *source, size_t *index);
-const char *identifier_type(const char *start, size_t length);
+void *xmalloc(size_t size);
+void *xrealloc(void *pointer, size_t size);
+void free_token_array(TokenArray *tokens);
+void append_token(TokenArray *tokens, Token token);
+void init_scanner(Scanner *scanner, const char *source);
+int scan_tokens(Scanner *scanner);
+void scan_token(Scanner *scanner);
+void scan_string(Scanner *scanner);
+void scan_number(Scanner *scanner);
+void scan_identifier(Scanner *scanner);
+void add_token(Scanner *scanner, TokenType type);
+void add_number_token(Scanner *scanner, double number);
+int scanner_is_at_end(const Scanner *scanner);
+char scanner_advance(Scanner *scanner);
+char scanner_peek(const Scanner *scanner);
+char scanner_peek_next(const Scanner *scanner);
+int scanner_match(Scanner *scanner, char expected);
+void scanner_error(Scanner *scanner, int line, const char *message);
+TokenType identifier_type(const char *start, size_t length);
+const char *token_type_name(TokenType type);
+void print_tokens(const TokenArray *tokens);
+void print_token(const Token *token);
+void print_token_lexeme(const Token *token);
+void print_token_literal(const Token *token);
+void format_number_literal(double value, char *buffer, size_t buffer_size);
+double parse_number_slice(const char *start, size_t length);
 int is_digit(char c);
 int is_alpha(char c);
 int is_alphanumeric(char c);
-void format_number_literal(double value, char *buffer, size_t buffer_size);
+Expr *parse_expression(Parser *parser);
+Expr *parse_equality(Parser *parser);
+Expr *parse_comparison(Parser *parser);
+Expr *parse_term(Parser *parser);
+Expr *parse_factor(Parser *parser);
+Expr *parse_unary(Parser *parser);
+Expr *parse_primary(Parser *parser);
+Expr *new_binary_expr(Expr *left, Token operator_token, Expr *right);
+Expr *new_grouping_expr(Expr *expression);
+Expr *new_nil_literal_expr(void);
+Expr *new_boolean_literal_expr(int boolean);
+Expr *new_number_literal_expr(double number);
+Expr *new_string_literal_expr(const char *start, size_t length);
+Expr *new_unary_expr(Token operator_token, Expr *right);
+void free_expr(Expr *expr);
+int parser_is_at_end(const Parser *parser);
+Token parser_peek(const Parser *parser);
+Token parser_previous(const Parser *parser);
+Token parser_advance(Parser *parser);
+int parser_check(const Parser *parser, TokenType type);
+int parser_match(Parser *parser, const TokenType *types, size_t count);
+Token parser_consume(Parser *parser, TokenType type, const char *message);
+void parser_error(Parser *parser, Token token, const char *message);
+void print_expr(const Expr *expr);
+void print_parenthesized(const char *name, size_t name_length, const Expr *const *expressions, size_t expression_count);
+int run_tokenize_command(const char *filename);
+int run_parse_command(const char *filename);
 
 int main(int argc, char *argv[]) {
-    // Disable output buffering
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
     if (argc < 3) {
-        fprintf(stderr, "Usage: ./your_program tokenize <filename>\n");
+        fprintf(stderr, "Usage: ./your_program <command> <filename>\n");
         return 1;
     }
 
-    const char *command = argv[1];
+    if (strcmp(argv[1], "tokenize") == 0) {
+        return run_tokenize_command(argv[2]);
+    }
 
-    if (strcmp(command, "tokenize") == 0) {
-        char *file_contents = read_file_contents(argv[2]);
-        if (file_contents == NULL) {
-            return 1;
-        }
+    if (strcmp(argv[1], "parse") == 0) {
+        return run_parse_command(argv[2]);
+    }
 
-        int exit_code = scan_tokens(file_contents);
-        free(file_contents);
-        return exit_code;
-    } else {
-        fprintf(stderr, "Unknown command: %s\n", command);
+    fprintf(stderr, "Unknown command: %s\n", argv[1]);
+    return 1;
+}
+
+int run_tokenize_command(const char *filename) {
+    char *source = read_file_contents(filename);
+    if (source == NULL) {
         return 1;
     }
 
+    Scanner scanner;
+    init_scanner(&scanner, source);
+    int exit_code = scan_tokens(&scanner);
+
+    print_tokens(&scanner.tokens);
+
+    free_token_array(&scanner.tokens);
+    free(source);
+    return exit_code;
+}
+
+int run_parse_command(const char *filename) {
+    char *source = read_file_contents(filename);
+    if (source == NULL) {
+        return 1;
+    }
+
+    Scanner scanner;
+    init_scanner(&scanner, source);
+    int scan_exit_code = scan_tokens(&scanner);
+
+    if (scan_exit_code != 0) {
+        free_token_array(&scanner.tokens);
+        free(source);
+        return scan_exit_code;
+    }
+
+    Parser parser = {
+        .tokens = &scanner.tokens,
+        .current = 0,
+        .had_error = 0,
+    };
+
+    Expr *expression = parse_expression(&parser);
+    if (!parser.had_error && !parser_is_at_end(&parser)) {
+        parser_error(&parser, parser_peek(&parser), "Expect end of expression.");
+    }
+
+    if (expression == NULL || parser.had_error) {
+        free_expr(expression);
+        free_token_array(&scanner.tokens);
+        free(source);
+        return 65;
+    }
+
+    print_expr(expression);
+    printf("\n");
+
+    free_expr(expression);
+    free_token_array(&scanner.tokens);
+    free(source);
     return 0;
 }
 
@@ -52,24 +260,23 @@ char *read_file_contents(const char *filename) {
         return NULL;
     }
 
-    fseek(file, 0, SEEK_END);
-    long file_size_long = ftell(file);
-    rewind(file);
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fprintf(stderr, "Error determining file size\n");
+        fclose(file);
+        return NULL;
+    }
 
+    long file_size_long = ftell(file);
     if (file_size_long < 0) {
         fprintf(stderr, "Error determining file size\n");
         fclose(file);
         return NULL;
     }
 
-    size_t file_size = (size_t)file_size_long;
+    rewind(file);
 
-    char *file_contents = malloc(file_size + 1);
-    if (file_contents == NULL) {
-        fprintf(stderr, "Memory allocation failed\n");
-        fclose(file);
-        return NULL;
-    }
+    size_t file_size = (size_t) file_size_long;
+    char *file_contents = xmalloc(file_size + 1);
 
     size_t bytes_read = fread(file_contents, 1, file_size, file);
     if (bytes_read < file_size) {
@@ -81,210 +288,384 @@ char *read_file_contents(const char *filename) {
 
     file_contents[file_size] = '\0';
     fclose(file);
-
     return file_contents;
 }
 
-int scan_tokens(const char *source) {
-    int had_error = 0;
-    int line = 1;
+void *xmalloc(size_t size) {
+    void *pointer = malloc(size);
+    if (pointer == NULL) {
+        fprintf(stderr, "Memory allocation failed\n");
+        exit(1);
+    }
 
-    for (size_t i = 0; source[i] != '\0'; i++) {
-        switch (source[i]) {
-            case '(':
-                print_token("LEFT_PAREN", "(");
-                break;
-            case ')':
-                print_token("RIGHT_PAREN", ")");
-                break;
-            case '{':
-                print_token("LEFT_BRACE", "{");
-                break;
-            case '}':
-                print_token("RIGHT_BRACE", "}");
-                break;
-            case ',':
-                print_token("COMMA", ",");
-                break;
-            case '.':
-                print_token("DOT", ".");
-                break;
-            case '-':
-                print_token("MINUS", "-");
-                break;
-            case '+':
-                print_token("PLUS", "+");
-                break;
-            case ';':
-                print_token("SEMICOLON", ";");
-                break;
-            case '*':
-                print_token("STAR", "*");
-                break;
-            case '=':
-                if (match_next(source, &i, '=')) {
-                    print_token("EQUAL_EQUAL", "==");
-                } else {
-                    print_token("EQUAL", "=");
+    return pointer;
+}
+
+void *xrealloc(void *pointer, size_t size) {
+    void *new_pointer = realloc(pointer, size);
+    if (new_pointer == NULL) {
+        fprintf(stderr, "Memory allocation failed\n");
+        exit(1);
+    }
+
+    return new_pointer;
+}
+
+void free_token_array(TokenArray *tokens) {
+    free(tokens->items);
+    tokens->items = NULL;
+    tokens->count = 0;
+    tokens->capacity = 0;
+}
+
+void append_token(TokenArray *tokens, Token token) {
+    if (tokens->count == tokens->capacity) {
+        size_t new_capacity = tokens->capacity < 8 ? 8 : tokens->capacity * 2;
+        tokens->items = xrealloc(tokens->items, new_capacity * sizeof(Token));
+        tokens->capacity = new_capacity;
+    }
+
+    tokens->items[tokens->count++] = token;
+}
+
+void init_scanner(Scanner *scanner, const char *source) {
+    scanner->source = source;
+    scanner->start = 0;
+    scanner->current = 0;
+    scanner->line = 1;
+    scanner->had_error = 0;
+    scanner->tokens.items = NULL;
+    scanner->tokens.count = 0;
+    scanner->tokens.capacity = 0;
+}
+
+int scan_tokens(Scanner *scanner) {
+    while (!scanner_is_at_end(scanner)) {
+        scanner->start = scanner->current;
+        scan_token(scanner);
+    }
+
+    scanner->start = scanner->current;
+    add_token(scanner, TOKEN_EOF);
+    return scanner->had_error ? 65 : 0;
+}
+
+void scan_token(Scanner *scanner) {
+    char c = scanner_advance(scanner);
+
+    switch (c) {
+        case '(':
+            add_token(scanner, TOKEN_LEFT_PAREN);
+            return;
+        case ')':
+            add_token(scanner, TOKEN_RIGHT_PAREN);
+            return;
+        case '{':
+            add_token(scanner, TOKEN_LEFT_BRACE);
+            return;
+        case '}':
+            add_token(scanner, TOKEN_RIGHT_BRACE);
+            return;
+        case ',':
+            add_token(scanner, TOKEN_COMMA);
+            return;
+        case '.':
+            add_token(scanner, TOKEN_DOT);
+            return;
+        case '-':
+            add_token(scanner, TOKEN_MINUS);
+            return;
+        case '+':
+            add_token(scanner, TOKEN_PLUS);
+            return;
+        case ';':
+            add_token(scanner, TOKEN_SEMICOLON);
+            return;
+        case '*':
+            add_token(scanner, TOKEN_STAR);
+            return;
+        case '!':
+            add_token(scanner, scanner_match(scanner, '=') ? TOKEN_BANG_EQUAL : TOKEN_BANG);
+            return;
+        case '=':
+            add_token(scanner, scanner_match(scanner, '=') ? TOKEN_EQUAL_EQUAL : TOKEN_EQUAL);
+            return;
+        case '<':
+            add_token(scanner, scanner_match(scanner, '=') ? TOKEN_LESS_EQUAL : TOKEN_LESS);
+            return;
+        case '>':
+            add_token(scanner, scanner_match(scanner, '=') ? TOKEN_GREATER_EQUAL : TOKEN_GREATER);
+            return;
+        case '/':
+            if (scanner_match(scanner, '/')) {
+                while (scanner_peek(scanner) != '\n' && !scanner_is_at_end(scanner)) {
+                    scanner_advance(scanner);
                 }
-                break;
-            case '!':
-                if (match_next(source, &i, '=')) {
-                    print_token("BANG_EQUAL", "!=");
-                } else {
-                    print_token("BANG", "!");
-                }
-                break;
-            case '<':
-                if (match_next(source, &i, '=')) {
-                    print_token("LESS_EQUAL", "<=");
-                } else {
-                    print_token("LESS", "<");
-                }
-                break;
-            case '>':
-                if (match_next(source, &i, '=')) {
-                    print_token("GREATER_EQUAL", ">=");
-                } else {
-                    print_token("GREATER", ">");
-                }
-                break;
-            case '/':
-                if (match_next(source, &i, '/')) {
-                    while (source[i + 1] != '\0' && source[i + 1] != '\n') {
-                        i++;
-                    }
-                } else {
-                    print_token("SLASH", "/");
-                }
-                break;
-            case '"':
-                if (scan_string(source, &i, &line)) {
-                    had_error = 1;
-                }
-                break;
-            case ' ':
-            case '\r':
-            case '\t':
-                break;
-            case '\n':
-                line++;
-                break;
-            default:
-                if (is_digit(source[i])) {
-                    scan_number(source, &i);
-                } else if (is_alpha(source[i])) {
-                    scan_identifier(source, &i);
-                } else {
-                    fprintf(stderr, "[line %d] Error: Unexpected character: %c\n", line, source[i]);
-                    had_error = 1;
-                }
-                break;
+                return;
+            }
+
+            add_token(scanner, TOKEN_SLASH);
+            return;
+        case ' ':
+        case '\r':
+        case '\t':
+            return;
+        case '\n':
+            scanner->line++;
+            return;
+        case '"':
+            scan_string(scanner);
+            return;
+        default:
+            if (is_digit(c)) {
+                scan_number(scanner);
+                return;
+            }
+
+            if (is_alpha(c)) {
+                scan_identifier(scanner);
+                return;
+            }
+
+            fprintf(stderr, "[line %d] Error: Unexpected character: %c\n", scanner->line, c);
+            scanner->had_error = 1;
+            return;
+    }
+}
+
+void scan_string(Scanner *scanner) {
+    while (scanner_peek(scanner) != '"' && !scanner_is_at_end(scanner)) {
+        if (scanner_peek(scanner) == '\n') {
+            scanner->line++;
+        }
+
+        scanner_advance(scanner);
+    }
+
+    if (scanner_is_at_end(scanner)) {
+        scanner_error(scanner, scanner->line, "Unterminated string.");
+        return;
+    }
+
+    scanner_advance(scanner);
+    add_token(scanner, TOKEN_STRING);
+}
+
+void scan_number(Scanner *scanner) {
+    while (is_digit(scanner_peek(scanner))) {
+        scanner_advance(scanner);
+    }
+
+    if (scanner_peek(scanner) == '.' && is_digit(scanner_peek_next(scanner))) {
+        scanner_advance(scanner);
+
+        while (is_digit(scanner_peek(scanner))) {
+            scanner_advance(scanner);
         }
     }
 
-    print_token("EOF", "");
-    return had_error ? 65 : 0;
+    add_number_token(scanner, parse_number_slice(scanner->source + scanner->start, scanner->current - scanner->start));
 }
 
-void print_token(const char *type, const char *lexeme) {
-    printf("%s %s null\n", type, lexeme);
+void scan_identifier(Scanner *scanner) {
+    while (is_alphanumeric(scanner_peek(scanner))) {
+        scanner_advance(scanner);
+    }
+
+    size_t length = scanner->current - scanner->start;
+    add_token(scanner, identifier_type(scanner->source + scanner->start, length));
 }
 
-void print_token_slices(const char *type, const char *lexeme, size_t lexeme_length, const char *literal, size_t literal_length) {
-    printf("%s %.*s %.*s\n", type, (int)lexeme_length, lexeme, (int)literal_length, literal);
+void add_token(Scanner *scanner, TokenType type) {
+    Token token = {
+        .type = type,
+        .start = scanner->source + scanner->start,
+        .length = scanner->current - scanner->start,
+        .line = scanner->line,
+        .number = 0,
+    };
+
+    append_token(&scanner->tokens, token);
 }
 
-int match_next(const char *source, size_t *index, char expected) {
-    if (source[*index + 1] != expected) {
+void add_number_token(Scanner *scanner, double number) {
+    Token token = {
+        .type = TOKEN_NUMBER,
+        .start = scanner->source + scanner->start,
+        .length = scanner->current - scanner->start,
+        .line = scanner->line,
+        .number = number,
+    };
+
+    append_token(&scanner->tokens, token);
+}
+
+int scanner_is_at_end(const Scanner *scanner) {
+    return scanner->source[scanner->current] == '\0';
+}
+
+char scanner_advance(Scanner *scanner) {
+    char c = scanner->source[scanner->current];
+    scanner->current++;
+    return c;
+}
+
+char scanner_peek(const Scanner *scanner) {
+    if (scanner_is_at_end(scanner)) {
+        return '\0';
+    }
+
+    return scanner->source[scanner->current];
+}
+
+char scanner_peek_next(const Scanner *scanner) {
+    if (scanner->source[scanner->current] == '\0' || scanner->source[scanner->current + 1] == '\0') {
+        return '\0';
+    }
+
+    return scanner->source[scanner->current + 1];
+}
+
+int scanner_match(Scanner *scanner, char expected) {
+    if (scanner_is_at_end(scanner)) {
         return 0;
     }
 
-    (*index)++;
+    if (scanner->source[scanner->current] != expected) {
+        return 0;
+    }
+
+    scanner->current++;
     return 1;
 }
 
-int scan_string(const char *source, size_t *index, int *line) {
-    size_t start = *index;
-    size_t current = start + 1;
+void scanner_error(Scanner *scanner, int line, const char *message) {
+    fprintf(stderr, "[line %d] Error: %s\n", line, message);
+    scanner->had_error = 1;
+}
 
-    while (source[current] != '"' && source[current] != '\0') {
-        if (source[current] == '\n') {
-            (*line)++;
+TokenType identifier_type(const char *start, size_t length) {
+    if (length == 2 && strncmp(start, "if", 2) == 0) return TOKEN_IF;
+    if (length == 2 && strncmp(start, "or", 2) == 0) return TOKEN_OR;
+    if (length == 3 && strncmp(start, "and", 3) == 0) return TOKEN_AND;
+    if (length == 3 && strncmp(start, "for", 3) == 0) return TOKEN_FOR;
+    if (length == 3 && strncmp(start, "fun", 3) == 0) return TOKEN_FUN;
+    if (length == 3 && strncmp(start, "nil", 3) == 0) return TOKEN_NIL;
+    if (length == 3 && strncmp(start, "var", 3) == 0) return TOKEN_VAR;
+    if (length == 4 && strncmp(start, "else", 4) == 0) return TOKEN_ELSE;
+    if (length == 4 && strncmp(start, "true", 4) == 0) return TOKEN_TRUE;
+    if (length == 4 && strncmp(start, "this", 4) == 0) return TOKEN_THIS;
+    if (length == 5 && strncmp(start, "class", 5) == 0) return TOKEN_CLASS;
+    if (length == 5 && strncmp(start, "false", 5) == 0) return TOKEN_FALSE;
+    if (length == 5 && strncmp(start, "print", 5) == 0) return TOKEN_PRINT;
+    if (length == 5 && strncmp(start, "super", 5) == 0) return TOKEN_SUPER;
+    if (length == 5 && strncmp(start, "while", 5) == 0) return TOKEN_WHILE;
+    if (length == 6 && strncmp(start, "return", 6) == 0) return TOKEN_RETURN;
+    return TOKEN_IDENTIFIER;
+}
+
+const char *token_type_name(TokenType type) {
+    switch (type) {
+        case TOKEN_LEFT_PAREN: return "LEFT_PAREN";
+        case TOKEN_RIGHT_PAREN: return "RIGHT_PAREN";
+        case TOKEN_LEFT_BRACE: return "LEFT_BRACE";
+        case TOKEN_RIGHT_BRACE: return "RIGHT_BRACE";
+        case TOKEN_COMMA: return "COMMA";
+        case TOKEN_DOT: return "DOT";
+        case TOKEN_MINUS: return "MINUS";
+        case TOKEN_PLUS: return "PLUS";
+        case TOKEN_SEMICOLON: return "SEMICOLON";
+        case TOKEN_SLASH: return "SLASH";
+        case TOKEN_STAR: return "STAR";
+        case TOKEN_BANG: return "BANG";
+        case TOKEN_BANG_EQUAL: return "BANG_EQUAL";
+        case TOKEN_EQUAL: return "EQUAL";
+        case TOKEN_EQUAL_EQUAL: return "EQUAL_EQUAL";
+        case TOKEN_GREATER: return "GREATER";
+        case TOKEN_GREATER_EQUAL: return "GREATER_EQUAL";
+        case TOKEN_LESS: return "LESS";
+        case TOKEN_LESS_EQUAL: return "LESS_EQUAL";
+        case TOKEN_IDENTIFIER: return "IDENTIFIER";
+        case TOKEN_STRING: return "STRING";
+        case TOKEN_NUMBER: return "NUMBER";
+        case TOKEN_AND: return "AND";
+        case TOKEN_CLASS: return "CLASS";
+        case TOKEN_ELSE: return "ELSE";
+        case TOKEN_FALSE: return "FALSE";
+        case TOKEN_FOR: return "FOR";
+        case TOKEN_FUN: return "FUN";
+        case TOKEN_IF: return "IF";
+        case TOKEN_NIL: return "NIL";
+        case TOKEN_OR: return "OR";
+        case TOKEN_PRINT: return "PRINT";
+        case TOKEN_RETURN: return "RETURN";
+        case TOKEN_SUPER: return "SUPER";
+        case TOKEN_THIS: return "THIS";
+        case TOKEN_TRUE: return "TRUE";
+        case TOKEN_VAR: return "VAR";
+        case TOKEN_WHILE: return "WHILE";
+        case TOKEN_EOF: return "EOF";
+    }
+
+    return "UNKNOWN";
+}
+
+void print_tokens(const TokenArray *tokens) {
+    for (size_t i = 0; i < tokens->count; i++) {
+        print_token(&tokens->items[i]);
+    }
+}
+
+void print_token(const Token *token) {
+    printf("%s ", token_type_name(token->type));
+    print_token_lexeme(token);
+    printf(" ");
+    print_token_literal(token);
+    printf("\n");
+}
+
+void print_token_lexeme(const Token *token) {
+    printf("%.*s", (int) token->length, token->start);
+}
+
+void print_token_literal(const Token *token) {
+    switch (token->type) {
+        case TOKEN_STRING:
+            printf("%.*s", (int) (token->length - 2), token->start + 1);
+            return;
+        case TOKEN_NUMBER: {
+            char literal[64];
+            format_number_literal(token->number, literal, sizeof(literal));
+            printf("%s", literal);
+            return;
         }
-
-        current++;
+        default:
+            printf("null");
+            return;
     }
-
-    if (source[current] == '\0') {
-        fprintf(stderr, "[line %d] Error: Unterminated string.\n", *line);
-        *index = current - 1;
-        return 1;
-    }
-
-    print_token_slices("STRING", source + start, current - start + 1, source + start + 1, current - start - 1);
-    *index = current;
-    return 0;
 }
 
-int scan_number(const char *source, size_t *index) {
-    size_t start = *index;
-    size_t current = start;
+void format_number_literal(double value, char *buffer, size_t buffer_size) {
+    snprintf(buffer, buffer_size, "%.15g", value);
 
-    while (is_digit(source[current + 1])) {
-        current++;
-    }
-
-    if (source[current + 1] == '.' && is_digit(source[current + 2])) {
-        current++;
-
-        while (is_digit(source[current + 1])) {
-            current++;
+    if (strchr(buffer, '.') == NULL && strchr(buffer, 'e') == NULL && strchr(buffer, 'E') == NULL) {
+        size_t length = strlen(buffer);
+        if (length + 2 < buffer_size) {
+            buffer[length] = '.';
+            buffer[length + 1] = '0';
+            buffer[length + 2] = '\0';
         }
     }
-
-    double value = strtod(source + start, NULL);
-    char literal[64];
-    format_number_literal(value, literal, sizeof(literal));
-
-    print_token_slices("NUMBER", source + start, current - start + 1, literal, strlen(literal));
-    *index = current;
-    return 0;
 }
 
-int scan_identifier(const char *source, size_t *index) {
-    size_t start = *index;
-    size_t current = start;
+double parse_number_slice(const char *start, size_t length) {
+    char *buffer = xmalloc(length + 1);
+    memcpy(buffer, start, length);
+    buffer[length] = '\0';
 
-    while (is_alphanumeric(source[current + 1])) {
-        current++;
-    }
-
-    size_t length = current - start + 1;
-    printf("%s %.*s null\n", identifier_type(source + start, length), (int)length, source + start);
-    *index = current;
-    return 0;
-}
-
-const char *identifier_type(const char *start, size_t length) {
-    if (length == 2 && strncmp(start, "if", 2) == 0) return "IF";
-    if (length == 2 && strncmp(start, "or", 2) == 0) return "OR";
-    if (length == 3 && strncmp(start, "and", 3) == 0) return "AND";
-    if (length == 3 && strncmp(start, "for", 3) == 0) return "FOR";
-    if (length == 3 && strncmp(start, "fun", 3) == 0) return "FUN";
-    if (length == 3 && strncmp(start, "nil", 3) == 0) return "NIL";
-    if (length == 3 && strncmp(start, "var", 3) == 0) return "VAR";
-    if (length == 4 && strncmp(start, "else", 4) == 0) return "ELSE";
-    if (length == 5 && strncmp(start, "false", 5) == 0) return "FALSE";
-    if (length == 4 && strncmp(start, "true", 4) == 0) return "TRUE";
-    if (length == 4 && strncmp(start, "this", 4) == 0) return "THIS";
-    if (length == 5 && strncmp(start, "class", 5) == 0) return "CLASS";
-    if (length == 5 && strncmp(start, "print", 5) == 0) return "PRINT";
-    if (length == 5 && strncmp(start, "super", 5) == 0) return "SUPER";
-    if (length == 5 && strncmp(start, "while", 5) == 0) return "WHILE";
-    if (length == 6 && strncmp(start, "return", 6) == 0) return "RETURN";
-
-    return "IDENTIFIER";
+    double value = strtod(buffer, NULL);
+    free(buffer);
+    return value;
 }
 
 int is_digit(char c) {
@@ -299,16 +680,363 @@ int is_alphanumeric(char c) {
     return is_alpha(c) || is_digit(c);
 }
 
-void format_number_literal(double value, char *buffer, size_t buffer_size) {
-    snprintf(buffer, buffer_size, "%.15g", value);
+Expr *parse_expression(Parser *parser) {
+    return parse_equality(parser);
+}
 
-    if (strchr(buffer, '.') == NULL && strchr(buffer, 'e') == NULL && strchr(buffer, 'E') == NULL) {
-        size_t length = strlen(buffer);
+Expr *parse_equality(Parser *parser) {
+    Expr *expression = parse_comparison(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
 
-        if (length + 2 < buffer_size) {
-            buffer[length] = '.';
-            buffer[length + 1] = '0';
-            buffer[length + 2] = '\0';
+    TokenType operators[] = {TOKEN_BANG_EQUAL, TOKEN_EQUAL_EQUAL};
+    while (parser_match(parser, operators, sizeof(operators) / sizeof(operators[0]))) {
+        Token operator_token = parser_previous(parser);
+        Expr *right = parse_comparison(parser);
+        if (right == NULL) {
+            free_expr(expression);
+            return NULL;
+        }
+
+        expression = new_binary_expr(expression, operator_token, right);
+    }
+
+    return expression;
+}
+
+Expr *parse_comparison(Parser *parser) {
+    Expr *expression = parse_term(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
+
+    TokenType operators[] = {
+        TOKEN_GREATER,
+        TOKEN_GREATER_EQUAL,
+        TOKEN_LESS,
+        TOKEN_LESS_EQUAL,
+    };
+
+    while (parser_match(parser, operators, sizeof(operators) / sizeof(operators[0]))) {
+        Token operator_token = parser_previous(parser);
+        Expr *right = parse_term(parser);
+        if (right == NULL) {
+            free_expr(expression);
+            return NULL;
+        }
+
+        expression = new_binary_expr(expression, operator_token, right);
+    }
+
+    return expression;
+}
+
+Expr *parse_term(Parser *parser) {
+    Expr *expression = parse_factor(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
+
+    TokenType operators[] = {TOKEN_MINUS, TOKEN_PLUS};
+    while (parser_match(parser, operators, sizeof(operators) / sizeof(operators[0]))) {
+        Token operator_token = parser_previous(parser);
+        Expr *right = parse_factor(parser);
+        if (right == NULL) {
+            free_expr(expression);
+            return NULL;
+        }
+
+        expression = new_binary_expr(expression, operator_token, right);
+    }
+
+    return expression;
+}
+
+Expr *parse_factor(Parser *parser) {
+    Expr *expression = parse_unary(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
+
+    TokenType operators[] = {TOKEN_SLASH, TOKEN_STAR};
+    while (parser_match(parser, operators, sizeof(operators) / sizeof(operators[0]))) {
+        Token operator_token = parser_previous(parser);
+        Expr *right = parse_unary(parser);
+        if (right == NULL) {
+            free_expr(expression);
+            return NULL;
+        }
+
+        expression = new_binary_expr(expression, operator_token, right);
+    }
+
+    return expression;
+}
+
+Expr *parse_unary(Parser *parser) {
+    TokenType operators[] = {TOKEN_BANG, TOKEN_MINUS};
+    if (parser_match(parser, operators, sizeof(operators) / sizeof(operators[0]))) {
+        Token operator_token = parser_previous(parser);
+        Expr *right = parse_unary(parser);
+        if (right == NULL) {
+            return NULL;
+        }
+
+        return new_unary_expr(operator_token, right);
+    }
+
+    return parse_primary(parser);
+}
+
+Expr *parse_primary(Parser *parser) {
+    if (parser_match(parser, &(TokenType){TOKEN_FALSE}, 1)) {
+        return new_boolean_literal_expr(0);
+    }
+
+    if (parser_match(parser, &(TokenType){TOKEN_TRUE}, 1)) {
+        return new_boolean_literal_expr(1);
+    }
+
+    if (parser_match(parser, &(TokenType){TOKEN_NIL}, 1)) {
+        return new_nil_literal_expr();
+    }
+
+    if (parser_match(parser, &(TokenType){TOKEN_NUMBER}, 1)) {
+        return new_number_literal_expr(parser_previous(parser).number);
+    }
+
+    if (parser_match(parser, &(TokenType){TOKEN_STRING}, 1)) {
+        Token string_token = parser_previous(parser);
+        return new_string_literal_expr(string_token.start + 1, string_token.length - 2);
+    }
+
+    if (parser_match(parser, &(TokenType){TOKEN_LEFT_PAREN}, 1)) {
+        Expr *expression = parse_expression(parser);
+        if (expression == NULL) {
+            return NULL;
+        }
+
+        parser_consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after expression.");
+        if (parser->had_error) {
+            free_expr(expression);
+            return NULL;
+        }
+
+        return new_grouping_expr(expression);
+    }
+
+    parser_error(parser, parser_peek(parser), "Expect expression.");
+    return NULL;
+}
+
+Expr *new_binary_expr(Expr *left, Token operator_token, Expr *right) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_BINARY;
+    expr->as.binary.left = left;
+    expr->as.binary.operator_token = operator_token;
+    expr->as.binary.right = right;
+    return expr;
+}
+
+Expr *new_grouping_expr(Expr *expression) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_GROUPING;
+    expr->as.grouping.expression = expression;
+    return expr;
+}
+
+Expr *new_nil_literal_expr(void) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_LITERAL;
+    expr->as.literal.type = LITERAL_NIL;
+    expr->as.literal.boolean = 0;
+    expr->as.literal.number = 0;
+    expr->as.literal.string_start = NULL;
+    expr->as.literal.string_length = 0;
+    return expr;
+}
+
+Expr *new_boolean_literal_expr(int boolean) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_LITERAL;
+    expr->as.literal.type = LITERAL_BOOL;
+    expr->as.literal.boolean = boolean;
+    expr->as.literal.number = 0;
+    expr->as.literal.string_start = NULL;
+    expr->as.literal.string_length = 0;
+    return expr;
+}
+
+Expr *new_number_literal_expr(double number) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_LITERAL;
+    expr->as.literal.type = LITERAL_NUMBER;
+    expr->as.literal.boolean = 0;
+    expr->as.literal.number = number;
+    expr->as.literal.string_start = NULL;
+    expr->as.literal.string_length = 0;
+    return expr;
+}
+
+Expr *new_string_literal_expr(const char *start, size_t length) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_LITERAL;
+    expr->as.literal.type = LITERAL_STRING;
+    expr->as.literal.boolean = 0;
+    expr->as.literal.number = 0;
+    expr->as.literal.string_start = start;
+    expr->as.literal.string_length = length;
+    return expr;
+}
+
+Expr *new_unary_expr(Token operator_token, Expr *right) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_UNARY;
+    expr->as.unary.operator_token = operator_token;
+    expr->as.unary.right = right;
+    return expr;
+}
+
+void free_expr(Expr *expr) {
+    if (expr == NULL) {
+        return;
+    }
+
+    switch (expr->type) {
+        case EXPR_BINARY:
+            free_expr(expr->as.binary.left);
+            free_expr(expr->as.binary.right);
+            break;
+        case EXPR_GROUPING:
+            free_expr(expr->as.grouping.expression);
+            break;
+        case EXPR_UNARY:
+            free_expr(expr->as.unary.right);
+            break;
+        case EXPR_LITERAL:
+            break;
+    }
+
+    free(expr);
+}
+
+int parser_is_at_end(const Parser *parser) {
+    return parser_peek(parser).type == TOKEN_EOF;
+}
+
+Token parser_peek(const Parser *parser) {
+    return parser->tokens->items[parser->current];
+}
+
+Token parser_previous(const Parser *parser) {
+    return parser->tokens->items[parser->current - 1];
+}
+
+Token parser_advance(Parser *parser) {
+    if (!parser_is_at_end(parser)) {
+        parser->current++;
+    }
+
+    return parser_previous(parser);
+}
+
+int parser_check(const Parser *parser, TokenType type) {
+    if (parser_is_at_end(parser)) {
+        return type == TOKEN_EOF;
+    }
+
+    return parser_peek(parser).type == type;
+}
+
+int parser_match(Parser *parser, const TokenType *types, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (parser_check(parser, types[i])) {
+            parser_advance(parser);
+            return 1;
         }
     }
+
+    return 0;
+}
+
+Token parser_consume(Parser *parser, TokenType type, const char *message) {
+    if (parser_check(parser, type)) {
+        return parser_advance(parser);
+    }
+
+    parser_error(parser, parser_peek(parser), message);
+    return parser_peek(parser);
+}
+
+void parser_error(Parser *parser, Token token, const char *message) {
+    if (token.type == TOKEN_EOF) {
+        fprintf(stderr, "[line %d] Error at end: %s\n", token.line, message);
+    } else {
+        fprintf(stderr, "[line %d] Error at '%.*s': %s\n", token.line, (int) token.length, token.start, message);
+    }
+
+    parser->had_error = 1;
+}
+
+void print_expr(const Expr *expr) {
+    switch (expr->type) {
+        case EXPR_BINARY: {
+            const Expr *expressions[] = {
+                expr->as.binary.left,
+                expr->as.binary.right,
+            };
+            print_parenthesized(
+                expr->as.binary.operator_token.start,
+                expr->as.binary.operator_token.length,
+                expressions,
+                sizeof(expressions) / sizeof(expressions[0]));
+            return;
+        }
+        case EXPR_GROUPING: {
+            const Expr *expressions[] = {expr->as.grouping.expression};
+            print_parenthesized("group", strlen("group"), expressions, sizeof(expressions) / sizeof(expressions[0]));
+            return;
+        }
+        case EXPR_LITERAL:
+            switch (expr->as.literal.type) {
+                case LITERAL_NIL:
+                    printf("nil");
+                    return;
+                case LITERAL_BOOL:
+                    printf("%s", expr->as.literal.boolean ? "true" : "false");
+                    return;
+                case LITERAL_NUMBER: {
+                    char literal[64];
+                    format_number_literal(expr->as.literal.number, literal, sizeof(literal));
+                    printf("%s", literal);
+                    return;
+                }
+                case LITERAL_STRING:
+                    printf("%.*s", (int) expr->as.literal.string_length, expr->as.literal.string_start);
+                    return;
+            }
+            return;
+        case EXPR_UNARY: {
+            const Expr *expressions[] = {expr->as.unary.right};
+            print_parenthesized(
+                expr->as.unary.operator_token.start,
+                expr->as.unary.operator_token.length,
+                expressions,
+                sizeof(expressions) / sizeof(expressions[0]));
+            return;
+        }
+    }
+}
+
+void print_parenthesized(const char *name, size_t name_length, const Expr *const *expressions, size_t expression_count) {
+    printf("(");
+    printf("%.*s", (int) name_length, name);
+
+    for (size_t i = 0; i < expression_count; i++) {
+        printf(" ");
+        print_expr(expressions[i]);
+    }
+
+    printf(")");
 }
