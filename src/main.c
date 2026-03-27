@@ -81,6 +81,13 @@ typedef enum {
     LITERAL_STRING
 } LiteralType;
 
+typedef enum {
+    VALUE_NIL,
+    VALUE_BOOL,
+    VALUE_NUMBER,
+    VALUE_STRING
+} ValueType;
+
 typedef struct Expr Expr;
 
 struct Expr {
@@ -107,6 +114,18 @@ struct Expr {
         } unary;
     } as;
 };
+
+typedef struct {
+    ValueType type;
+    union {
+        int boolean;
+        double number;
+        struct {
+            const char *start;
+            size_t length;
+        } string;
+    } as;
+} Value;
 
 typedef struct {
     TokenArray *tokens;
@@ -140,6 +159,7 @@ void print_token(const Token *token);
 void print_token_lexeme(const Token *token);
 void print_token_literal(const Token *token);
 void format_number_literal(double value, char *buffer, size_t buffer_size);
+void format_number_value(double value, char *buffer, size_t buffer_size);
 double parse_number_slice(const char *start, size_t length);
 int is_digit(char c);
 int is_alpha(char c);
@@ -169,8 +189,18 @@ Token parser_consume(Parser *parser, TokenType type, const char *message);
 void parser_error(Parser *parser, Token token, const char *message);
 void print_expr(const Expr *expr);
 void print_parenthesized(const char *name, size_t name_length, const Expr *const *expressions, size_t expression_count);
+int parse_file_to_expression(const char *filename, char **source_out, TokenArray *tokens_out, Expr **expression_out);
+Value evaluate_expr(const Expr *expr, int *had_runtime_error);
+Value make_nil_value(void);
+Value make_boolean_value(int boolean);
+Value make_number_value(double number);
+Value make_string_value(const char *start, size_t length);
+int is_truthy(Value value);
+int values_equal(Value left, Value right);
+void print_value(Value value);
 int run_tokenize_command(const char *filename);
 int run_parse_command(const char *filename);
+int run_evaluate_command(const char *filename);
 
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
@@ -187,6 +217,10 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "parse") == 0) {
         return run_parse_command(argv[2]);
+    }
+
+    if (strcmp(argv[1], "evaluate") == 0) {
+        return run_evaluate_command(argv[2]);
     }
 
     fprintf(stderr, "Unknown command: %s\n", argv[1]);
@@ -211,44 +245,46 @@ int run_tokenize_command(const char *filename) {
 }
 
 int run_parse_command(const char *filename) {
-    char *source = read_file_contents(filename);
-    if (source == NULL) {
-        return 1;
-    }
-
-    Scanner scanner;
-    init_scanner(&scanner, source);
-    int scan_exit_code = scan_tokens(&scanner);
-
-    if (scan_exit_code != 0) {
-        free_token_array(&scanner.tokens);
-        free(source);
-        return scan_exit_code;
-    }
-
-    Parser parser = {
-        .tokens = &scanner.tokens,
-        .current = 0,
-        .had_error = 0,
-    };
-
-    Expr *expression = parse_expression(&parser);
-    if (!parser.had_error && !parser_is_at_end(&parser)) {
-        parser_error(&parser, parser_peek(&parser), "Expect end of expression.");
-    }
-
-    if (expression == NULL || parser.had_error) {
-        free_expr(expression);
-        free_token_array(&scanner.tokens);
-        free(source);
-        return 65;
+    char *source = NULL;
+    TokenArray tokens = {0};
+    Expr *expression = NULL;
+    int exit_code = parse_file_to_expression(filename, &source, &tokens, &expression);
+    if (exit_code != 0) {
+        return exit_code;
     }
 
     print_expr(expression);
     printf("\n");
 
     free_expr(expression);
-    free_token_array(&scanner.tokens);
+    free_token_array(&tokens);
+    free(source);
+    return 0;
+}
+
+int run_evaluate_command(const char *filename) {
+    char *source = NULL;
+    TokenArray tokens = {0};
+    Expr *expression = NULL;
+    int exit_code = parse_file_to_expression(filename, &source, &tokens, &expression);
+    if (exit_code != 0) {
+        return exit_code;
+    }
+
+    int had_runtime_error = 0;
+    Value value = evaluate_expr(expression, &had_runtime_error);
+    if (had_runtime_error) {
+        free_expr(expression);
+        free_token_array(&tokens);
+        free(source);
+        return 70;
+    }
+
+    print_value(value);
+    printf("\n");
+
+    free_expr(expression);
+    free_token_array(&tokens);
     free(source);
     return 0;
 }
@@ -658,6 +694,10 @@ void format_number_literal(double value, char *buffer, size_t buffer_size) {
     }
 }
 
+void format_number_value(double value, char *buffer, size_t buffer_size) {
+    snprintf(buffer, buffer_size, "%.15g", value);
+}
+
 double parse_number_slice(const char *start, size_t length) {
     char *buffer = xmalloc(length + 1);
     memcpy(buffer, start, length);
@@ -1039,4 +1079,255 @@ void print_parenthesized(const char *name, size_t name_length, const Expr *const
     }
 
     printf(")");
+}
+
+int parse_file_to_expression(const char *filename, char **source_out, TokenArray *tokens_out, Expr **expression_out) {
+    *source_out = NULL;
+    tokens_out->items = NULL;
+    tokens_out->count = 0;
+    tokens_out->capacity = 0;
+    *expression_out = NULL;
+
+    char *source = read_file_contents(filename);
+    if (source == NULL) {
+        return 1;
+    }
+
+    Scanner scanner;
+    init_scanner(&scanner, source);
+    int scan_exit_code = scan_tokens(&scanner);
+
+    if (scan_exit_code != 0) {
+        free_token_array(&scanner.tokens);
+        free(source);
+        return scan_exit_code;
+    }
+
+    Parser parser = {
+        .tokens = &scanner.tokens,
+        .current = 0,
+        .had_error = 0,
+    };
+
+    Expr *expression = parse_expression(&parser);
+    if (!parser.had_error && !parser_is_at_end(&parser)) {
+        parser_error(&parser, parser_peek(&parser), "Expect end of expression.");
+    }
+
+    if (expression == NULL || parser.had_error) {
+        free_expr(expression);
+        free_token_array(&scanner.tokens);
+        free(source);
+        return 65;
+    }
+
+    *source_out = source;
+    *tokens_out = scanner.tokens;
+    *expression_out = expression;
+    return 0;
+}
+
+Value evaluate_expr(const Expr *expr, int *had_runtime_error) {
+    switch (expr->type) {
+        case EXPR_LITERAL:
+            switch (expr->as.literal.type) {
+                case LITERAL_NIL:
+                    return make_nil_value();
+                case LITERAL_BOOL:
+                    return make_boolean_value(expr->as.literal.boolean);
+                case LITERAL_NUMBER:
+                    return make_number_value(expr->as.literal.number);
+                case LITERAL_STRING:
+                    return make_string_value(expr->as.literal.string_start, expr->as.literal.string_length);
+            }
+            break;
+        case EXPR_GROUPING:
+            return evaluate_expr(expr->as.grouping.expression, had_runtime_error);
+        case EXPR_UNARY: {
+            Value right = evaluate_expr(expr->as.unary.right, had_runtime_error);
+            if (*had_runtime_error) {
+                return make_nil_value();
+            }
+
+            switch (expr->as.unary.operator_token.type) {
+                case TOKEN_BANG:
+                    return make_boolean_value(!is_truthy(right));
+                case TOKEN_MINUS:
+                    if (right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operand must be a number.\n", expr->as.unary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_number_value(-right.as.number);
+                default:
+                    break;
+            }
+            break;
+        }
+        case EXPR_BINARY: {
+            Value left = evaluate_expr(expr->as.binary.left, had_runtime_error);
+            if (*had_runtime_error) {
+                return make_nil_value();
+            }
+
+            Value right = evaluate_expr(expr->as.binary.right, had_runtime_error);
+            if (*had_runtime_error) {
+                return make_nil_value();
+            }
+
+            switch (expr->as.binary.operator_token.type) {
+                case TOKEN_BANG_EQUAL:
+                    return make_boolean_value(!values_equal(left, right));
+                case TOKEN_EQUAL_EQUAL:
+                    return make_boolean_value(values_equal(left, right));
+                case TOKEN_GREATER:
+                    if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_boolean_value(left.as.number > right.as.number);
+                case TOKEN_GREATER_EQUAL:
+                    if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_boolean_value(left.as.number >= right.as.number);
+                case TOKEN_LESS:
+                    if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_boolean_value(left.as.number < right.as.number);
+                case TOKEN_LESS_EQUAL:
+                    if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_boolean_value(left.as.number <= right.as.number);
+                case TOKEN_MINUS:
+                    if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_number_value(left.as.number - right.as.number);
+                case TOKEN_PLUS:
+                    if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_number_value(left.as.number + right.as.number);
+                case TOKEN_SLASH:
+                    if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_number_value(left.as.number / right.as.number);
+                case TOKEN_STAR:
+                    if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        *had_runtime_error = 1;
+                        return make_nil_value();
+                    }
+                    return make_number_value(left.as.number * right.as.number);
+                default:
+                    break;
+            }
+            break;
+        }
+    }
+
+    fprintf(stderr, "Runtime error: Unsupported expression.\n");
+    *had_runtime_error = 1;
+    return make_nil_value();
+}
+
+Value make_nil_value(void) {
+    Value value = {.type = VALUE_NIL};
+    return value;
+}
+
+Value make_boolean_value(int boolean) {
+    Value value = {
+        .type = VALUE_BOOL,
+        .as.boolean = boolean,
+    };
+    return value;
+}
+
+Value make_number_value(double number) {
+    Value value = {
+        .type = VALUE_NUMBER,
+        .as.number = number,
+    };
+    return value;
+}
+
+Value make_string_value(const char *start, size_t length) {
+    Value value = {
+        .type = VALUE_STRING,
+        .as.string.start = start,
+        .as.string.length = length,
+    };
+    return value;
+}
+
+int is_truthy(Value value) {
+    switch (value.type) {
+        case VALUE_NIL:
+            return 0;
+        case VALUE_BOOL:
+            return value.as.boolean;
+        case VALUE_NUMBER:
+        case VALUE_STRING:
+            return 1;
+    }
+
+    return 0;
+}
+
+int values_equal(Value left, Value right) {
+    if (left.type != right.type) {
+        return 0;
+    }
+
+    switch (left.type) {
+        case VALUE_NIL:
+            return 1;
+        case VALUE_BOOL:
+            return left.as.boolean == right.as.boolean;
+        case VALUE_NUMBER:
+            return left.as.number == right.as.number;
+        case VALUE_STRING:
+            return left.as.string.length == right.as.string.length &&
+                   strncmp(left.as.string.start, right.as.string.start, left.as.string.length) == 0;
+    }
+
+    return 0;
+}
+
+void print_value(Value value) {
+    switch (value.type) {
+        case VALUE_NIL:
+            printf("nil");
+            return;
+        case VALUE_BOOL:
+            printf("%s", value.as.boolean ? "true" : "false");
+            return;
+        case VALUE_NUMBER: {
+            char literal[64];
+            format_number_value(value.as.number, literal, sizeof(literal));
+            printf("%s", literal);
+            return;
+        }
+        case VALUE_STRING:
+            printf("%.*s", (int) value.as.string.length, value.as.string.start);
+            return;
+    }
 }
