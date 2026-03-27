@@ -77,7 +77,9 @@ typedef enum {
     EXPR_VARIABLE,
     EXPR_ASSIGN,
     EXPR_LOGICAL,
-    EXPR_CALL
+    EXPR_CALL,
+    EXPR_GET,
+    EXPR_SET
 } ExprType;
 
 typedef enum {
@@ -125,6 +127,7 @@ typedef struct StmtArray {
 typedef struct NativeFunction NativeFunction;
 typedef struct ClassObject ClassObject;
 typedef struct InstanceObject InstanceObject;
+typedef struct EnvironmentEntry EnvironmentEntry;
 typedef struct Value Value;
 typedef struct Environment Environment;
 
@@ -171,6 +174,15 @@ struct Expr {
             Token paren;
             ExprArray arguments;
         } call;
+        struct {
+            Expr *object;
+            Token name;
+        } get;
+        struct {
+            Expr *object;
+            Token name;
+            Expr *value;
+        } set;
     } as;
 };
 
@@ -247,14 +259,17 @@ struct ClassObject {
 
 struct InstanceObject {
     ClassObject *class_object;
+    EnvironmentEntry *fields;
+    size_t field_count;
+    size_t field_capacity;
     size_t ref_count;
 };
 
-typedef struct {
+struct EnvironmentEntry {
     char *name;
     size_t length;
     Value value;
-} EnvironmentEntry;
+};
 
 struct Environment {
     EnvironmentEntry *items;
@@ -373,6 +388,8 @@ Expr *new_variable_expr(Token name);
 Expr *new_assign_expr(Token name, Expr *value);
 Expr *new_logical_expr(Expr *left, Token operator_token, Expr *right);
 Expr *new_call_expr(Expr *callee, Token paren, ExprArray arguments);
+Expr *new_get_expr(Expr *object, Token name);
+Expr *new_set_expr(Expr *object, Token name, Expr *value);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
@@ -434,6 +451,9 @@ Value concatenate_strings(Value left, Value right);
 void free_value(Value *value);
 Value native_clock(int argument_count, const Value *arguments);
 void runtime_error(int line, const char *format, ...);
+int find_instance_field(const InstanceObject *instance_object, const char *name, size_t length);
+void set_instance_field(InstanceObject *instance_object, Token name, Value value);
+Value get_instance_field(const InstanceObject *instance_object, Token name, int *had_runtime_error);
 int find_environment_entry(const Environment *environment, const char *name, size_t length);
 void define_variable(Environment *environment, Token name, Value value);
 Value get_resolved_variable(const Environment *environment, size_t distance, Token name, int *had_runtime_error);
@@ -1131,6 +1151,13 @@ Expr *parse_assignment(Parser *parser) {
             return new_assign_expr(name, value);
         }
 
+        if (expression->type == EXPR_GET) {
+            Expr *object = expression->as.get.object;
+            Token name = expression->as.get.name;
+            free(expression);
+            return new_set_expr(object, name, value);
+        }
+
         parser_error(parser, equals, "Invalid assignment target.");
         free_expr(expression);
         free_expr(value);
@@ -1292,13 +1319,21 @@ Expr *parse_call(Parser *parser) {
     }
 
     while (1) {
-        if (!parser_match(parser, &(TokenType){TOKEN_LEFT_PAREN}, 1)) {
-            break;
-        }
+        if (parser_match(parser, &(TokenType){TOKEN_LEFT_PAREN}, 1)) {
+            expression = parse_finish_call(parser, expression);
+            if (expression == NULL) {
+                return NULL;
+            }
+        } else if (parser_match(parser, &(TokenType){TOKEN_DOT}, 1)) {
+            Token name = parser_consume(parser, TOKEN_IDENTIFIER, "Expect property name after '.'.");
+            if (parser->had_error) {
+                free_expr(expression);
+                return NULL;
+            }
 
-        expression = parse_finish_call(parser, expression);
-        if (expression == NULL) {
-            return NULL;
+            expression = new_get_expr(expression, name);
+        } else {
+            break;
         }
     }
 
@@ -1858,6 +1893,23 @@ Expr *new_call_expr(Expr *callee, Token paren, ExprArray arguments) {
     return expr;
 }
 
+Expr *new_get_expr(Expr *object, Token name) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_GET;
+    expr->as.get.object = object;
+    expr->as.get.name = name;
+    return expr;
+}
+
+Expr *new_set_expr(Expr *object, Token name, Expr *value) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_SET;
+    expr->as.set.object = object;
+    expr->as.set.name = name;
+    expr->as.set.value = value;
+    return expr;
+}
+
 Stmt *new_expression_stmt(Expr *expression) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_EXPRESSION;
@@ -1954,6 +2006,13 @@ void free_expr(Expr *expr) {
         case EXPR_CALL:
             free_expr(expr->as.call.callee);
             free_expr_array(&expr->as.call.arguments);
+            break;
+        case EXPR_GET:
+            free_expr(expr->as.get.object);
+            break;
+        case EXPR_SET:
+            free_expr(expr->as.set.object);
+            free_expr(expr->as.set.value);
             break;
         case EXPR_VARIABLE:
         case EXPR_LITERAL:
@@ -2137,6 +2196,18 @@ void print_expr(const Expr *expr) {
                 printf(" ");
                 print_expr(expr->as.call.arguments.items[i]);
             }
+            printf(")");
+            return;
+        case EXPR_GET:
+            printf("(. ");
+            print_expr(expr->as.get.object);
+            printf(" %.*s)", (int) expr->as.get.name.length, expr->as.get.name.start);
+            return;
+        case EXPR_SET:
+            printf("(= ");
+            print_expr(expr->as.set.object);
+            printf(" %.*s ", (int) expr->as.set.name.length, expr->as.set.name.start);
+            print_expr(expr->as.set.value);
             printf(")");
             return;
     }
@@ -2444,6 +2515,13 @@ void resolver_resolve_expr(Resolver *resolver, Expr *expr) {
             for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
                 resolver_resolve_expr(resolver, expr->as.call.arguments.items[i]);
             }
+            return;
+        case EXPR_GET:
+            resolver_resolve_expr(resolver, expr->as.get.object);
+            return;
+        case EXPR_SET:
+            resolver_resolve_expr(resolver, expr->as.set.object);
+            resolver_resolve_expr(resolver, expr->as.set.value);
             return;
     }
 }
@@ -2898,6 +2976,49 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
             free_value(&callee);
             return result;
         }
+        case EXPR_GET: {
+            Value object = evaluate_expr(expr->as.get.object, environment, had_runtime_error);
+            if (*had_runtime_error) {
+                free_value(&object);
+                return make_nil_value();
+            }
+
+            if (object.type != VALUE_INSTANCE) {
+                runtime_error(expr->as.get.name.line, "Only instances have properties.");
+                *had_runtime_error = 1;
+                free_value(&object);
+                return make_nil_value();
+            }
+
+            Value result = get_instance_field(object.as.instance_object, expr->as.get.name, had_runtime_error);
+            free_value(&object);
+            return result;
+        }
+        case EXPR_SET: {
+            Value object = evaluate_expr(expr->as.set.object, environment, had_runtime_error);
+            if (*had_runtime_error) {
+                free_value(&object);
+                return make_nil_value();
+            }
+
+            if (object.type != VALUE_INSTANCE) {
+                runtime_error(expr->as.set.name.line, "Only instances have fields.");
+                *had_runtime_error = 1;
+                free_value(&object);
+                return make_nil_value();
+            }
+
+            Value value = evaluate_expr(expr->as.set.value, environment, had_runtime_error);
+            if (*had_runtime_error) {
+                free_value(&object);
+                free_value(&value);
+                return make_nil_value();
+            }
+
+            set_instance_field(object.as.instance_object, expr->as.set.name, value);
+            free_value(&object);
+            return value;
+        }
     }
 
     runtime_error(0, "Unsupported expression.");
@@ -2976,6 +3097,9 @@ Value make_class_value(ClassObject *class_object) {
 InstanceObject *new_instance_object(ClassObject *class_object) {
     InstanceObject *instance_object = xmalloc(sizeof(InstanceObject));
     instance_object->class_object = retain_class_object(class_object);
+    instance_object->fields = NULL;
+    instance_object->field_count = 0;
+    instance_object->field_capacity = 0;
     instance_object->ref_count = 1;
     return instance_object;
 }
@@ -2998,6 +3122,12 @@ void release_instance_object(InstanceObject *instance_object) {
         return;
     }
 
+    for (size_t i = 0; i < instance_object->field_count; i++) {
+        free(instance_object->fields[i].name);
+        free_value(&instance_object->fields[i].value);
+    }
+
+    free(instance_object->fields);
     release_class_object(instance_object->class_object);
     free(instance_object);
 }
@@ -3113,6 +3243,54 @@ void runtime_error(int line, const char *format, ...) {
     vfprintf(stderr, format, args);
     va_end(args);
     fprintf(stderr, "\n[line %d]\n", line);
+}
+
+int find_instance_field(const InstanceObject *instance_object, const char *name, size_t length) {
+    if (instance_object == NULL) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < instance_object->field_count; i++) {
+        if (instance_object->fields[i].length == length &&
+            strncmp(instance_object->fields[i].name, name, length) == 0) {
+            return (int) i;
+        }
+    }
+
+    return -1;
+}
+
+void set_instance_field(InstanceObject *instance_object, Token name, Value value) {
+    int existing_index = find_instance_field(instance_object, name.start, name.length);
+    Value stored_value = clone_value(value);
+
+    if (existing_index >= 0) {
+        free_value(&instance_object->fields[existing_index].value);
+        instance_object->fields[existing_index].value = stored_value;
+        return;
+    }
+
+    if (instance_object->field_count == instance_object->field_capacity) {
+        size_t new_capacity = instance_object->field_capacity < 8 ? 8 : instance_object->field_capacity * 2;
+        instance_object->fields = xrealloc(instance_object->fields, new_capacity * sizeof(EnvironmentEntry));
+        instance_object->field_capacity = new_capacity;
+    }
+
+    instance_object->fields[instance_object->field_count].name = copy_string_slice(name.start, name.length);
+    instance_object->fields[instance_object->field_count].length = name.length;
+    instance_object->fields[instance_object->field_count].value = stored_value;
+    instance_object->field_count++;
+}
+
+Value get_instance_field(const InstanceObject *instance_object, Token name, int *had_runtime_error) {
+    int index = find_instance_field(instance_object, name.start, name.length);
+    if (index >= 0) {
+        return clone_value(instance_object->fields[index].value);
+    }
+
+    runtime_error(name.line, "Undefined property '%.*s'.", (int) name.length, name.start);
+    *had_runtime_error = 1;
+    return make_nil_value();
 }
 
 int find_environment_entry(const Environment *environment, const char *name, size_t length) {
