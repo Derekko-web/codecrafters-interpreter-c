@@ -88,7 +88,13 @@ typedef enum {
     VALUE_STRING
 } ValueType;
 
+typedef enum {
+    STMT_EXPRESSION,
+    STMT_PRINT
+} StmtType;
+
 typedef struct Expr Expr;
+typedef struct Stmt Stmt;
 
 struct Expr {
     ExprType type;
@@ -115,6 +121,18 @@ struct Expr {
     } as;
 };
 
+struct Stmt {
+    StmtType type;
+    union {
+        struct {
+            Expr *expression;
+        } expression;
+        struct {
+            Expr *expression;
+        } print;
+    } as;
+};
+
 typedef struct {
     ValueType type;
     union {
@@ -129,6 +147,12 @@ typedef struct {
 } Value;
 
 typedef struct {
+    Stmt **items;
+    size_t count;
+    size_t capacity;
+} StmtArray;
+
+typedef struct {
     TokenArray *tokens;
     size_t current;
     int had_error;
@@ -139,6 +163,8 @@ void *xmalloc(size_t size);
 void *xrealloc(void *pointer, size_t size);
 void free_token_array(TokenArray *tokens);
 void append_token(TokenArray *tokens, Token token);
+void free_stmt_array(StmtArray *statements);
+void append_stmt(StmtArray *statements, Stmt *stmt);
 void init_scanner(Scanner *scanner, const char *source);
 int scan_tokens(Scanner *scanner);
 void scan_token(Scanner *scanner);
@@ -172,6 +198,9 @@ Expr *parse_term(Parser *parser);
 Expr *parse_factor(Parser *parser);
 Expr *parse_unary(Parser *parser);
 Expr *parse_primary(Parser *parser);
+Stmt *parse_statement(Parser *parser);
+Stmt *parse_print_statement(Parser *parser);
+Stmt *parse_expression_statement(Parser *parser);
 Expr *new_binary_expr(Expr *left, Token operator_token, Expr *right);
 Expr *new_grouping_expr(Expr *expression);
 Expr *new_nil_literal_expr(void);
@@ -179,7 +208,10 @@ Expr *new_boolean_literal_expr(int boolean);
 Expr *new_number_literal_expr(double number);
 Expr *new_string_literal_expr(const char *start, size_t length);
 Expr *new_unary_expr(Token operator_token, Expr *right);
+Stmt *new_expression_stmt(Expr *expression);
+Stmt *new_print_stmt(Expr *expression);
 void free_expr(Expr *expr);
+void free_stmt(Stmt *stmt);
 int parser_is_at_end(const Parser *parser);
 Token parser_peek(const Parser *parser);
 Token parser_previous(const Parser *parser);
@@ -190,7 +222,9 @@ Token parser_consume(Parser *parser, TokenType type, const char *message);
 void parser_error(Parser *parser, Token token, const char *message);
 void print_expr(const Expr *expr);
 void print_parenthesized(const char *name, size_t name_length, const Expr *const *expressions, size_t expression_count);
+int scan_file_to_tokens(const char *filename, char **source_out, TokenArray *tokens_out);
 int parse_file_to_expression(const char *filename, char **source_out, TokenArray *tokens_out, Expr **expression_out);
+int parse_file_to_statements(const char *filename, char **source_out, TokenArray *tokens_out, StmtArray *statements_out);
 Value evaluate_expr(const Expr *expr, int *had_runtime_error);
 Value make_nil_value(void);
 Value make_boolean_value(int boolean);
@@ -201,9 +235,12 @@ void free_value(Value *value);
 int is_truthy(Value value);
 int values_equal(Value left, Value right);
 void print_value(Value value);
+int interpret_statement(const Stmt *stmt);
+int interpret_statements(const StmtArray *statements);
 int run_tokenize_command(const char *filename);
 int run_parse_command(const char *filename);
 int run_evaluate_command(const char *filename);
+int run_run_command(const char *filename);
 
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
@@ -224,6 +261,10 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(argv[1], "evaluate") == 0) {
         return run_evaluate_command(argv[2]);
+    }
+
+    if (strcmp(argv[1], "run") == 0) {
+        return run_run_command(argv[2]);
     }
 
     fprintf(stderr, "Unknown command: %s\n", argv[1]);
@@ -358,6 +399,17 @@ void free_token_array(TokenArray *tokens) {
     tokens->capacity = 0;
 }
 
+void free_stmt_array(StmtArray *statements) {
+    for (size_t i = 0; i < statements->count; i++) {
+        free_stmt(statements->items[i]);
+    }
+
+    free(statements->items);
+    statements->items = NULL;
+    statements->count = 0;
+    statements->capacity = 0;
+}
+
 void append_token(TokenArray *tokens, Token token) {
     if (tokens->count == tokens->capacity) {
         size_t new_capacity = tokens->capacity < 8 ? 8 : tokens->capacity * 2;
@@ -366,6 +418,16 @@ void append_token(TokenArray *tokens, Token token) {
     }
 
     tokens->items[tokens->count++] = token;
+}
+
+void append_stmt(StmtArray *statements, Stmt *stmt) {
+    if (statements->count == statements->capacity) {
+        size_t new_capacity = statements->capacity < 8 ? 8 : statements->capacity * 2;
+        statements->items = xrealloc(statements->items, new_capacity * sizeof(Stmt *));
+        statements->capacity = new_capacity;
+    }
+
+    statements->items[statements->count++] = stmt;
 }
 
 void init_scanner(Scanner *scanner, const char *source) {
@@ -874,6 +936,44 @@ Expr *parse_primary(Parser *parser) {
     return NULL;
 }
 
+Stmt *parse_statement(Parser *parser) {
+    if (parser_match(parser, &(TokenType){TOKEN_PRINT}, 1)) {
+        return parse_print_statement(parser);
+    }
+
+    return parse_expression_statement(parser);
+}
+
+Stmt *parse_print_statement(Parser *parser) {
+    Expr *expression = parse_expression(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
+
+    parser_consume(parser, TOKEN_SEMICOLON, "Expect ';' after value.");
+    if (parser->had_error) {
+        free_expr(expression);
+        return NULL;
+    }
+
+    return new_print_stmt(expression);
+}
+
+Stmt *parse_expression_statement(Parser *parser) {
+    Expr *expression = parse_expression(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
+
+    parser_consume(parser, TOKEN_SEMICOLON, "Expect ';' after expression.");
+    if (parser->had_error) {
+        free_expr(expression);
+        return NULL;
+    }
+
+    return new_expression_stmt(expression);
+}
+
 Expr *new_binary_expr(Expr *left, Token operator_token, Expr *right) {
     Expr *expr = xmalloc(sizeof(Expr));
     expr->type = EXPR_BINARY;
@@ -942,6 +1042,20 @@ Expr *new_unary_expr(Token operator_token, Expr *right) {
     return expr;
 }
 
+Stmt *new_expression_stmt(Expr *expression) {
+    Stmt *stmt = xmalloc(sizeof(Stmt));
+    stmt->type = STMT_EXPRESSION;
+    stmt->as.expression.expression = expression;
+    return stmt;
+}
+
+Stmt *new_print_stmt(Expr *expression) {
+    Stmt *stmt = xmalloc(sizeof(Stmt));
+    stmt->type = STMT_PRINT;
+    stmt->as.print.expression = expression;
+    return stmt;
+}
+
 void free_expr(Expr *expr) {
     if (expr == NULL) {
         return;
@@ -963,6 +1077,23 @@ void free_expr(Expr *expr) {
     }
 
     free(expr);
+}
+
+void free_stmt(Stmt *stmt) {
+    if (stmt == NULL) {
+        return;
+    }
+
+    switch (stmt->type) {
+        case STMT_EXPRESSION:
+            free_expr(stmt->as.expression.expression);
+            break;
+        case STMT_PRINT:
+            free_expr(stmt->as.print.expression);
+            break;
+    }
+
+    free(stmt);
 }
 
 int parser_is_at_end(const Parser *parser) {
@@ -1085,12 +1216,11 @@ void print_parenthesized(const char *name, size_t name_length, const Expr *const
     printf(")");
 }
 
-int parse_file_to_expression(const char *filename, char **source_out, TokenArray *tokens_out, Expr **expression_out) {
+int scan_file_to_tokens(const char *filename, char **source_out, TokenArray *tokens_out) {
     *source_out = NULL;
     tokens_out->items = NULL;
     tokens_out->count = 0;
     tokens_out->capacity = 0;
-    *expression_out = NULL;
 
     char *source = read_file_contents(filename);
     if (source == NULL) {
@@ -1107,8 +1237,21 @@ int parse_file_to_expression(const char *filename, char **source_out, TokenArray
         return scan_exit_code;
     }
 
+    *source_out = source;
+    *tokens_out = scanner.tokens;
+    return 0;
+}
+
+int parse_file_to_expression(const char *filename, char **source_out, TokenArray *tokens_out, Expr **expression_out) {
+    *expression_out = NULL;
+
+    int scan_exit_code = scan_file_to_tokens(filename, source_out, tokens_out);
+    if (scan_exit_code != 0) {
+        return scan_exit_code;
+    }
+
     Parser parser = {
-        .tokens = &scanner.tokens,
+        .tokens = tokens_out,
         .current = 0,
         .had_error = 0,
     };
@@ -1120,14 +1263,47 @@ int parse_file_to_expression(const char *filename, char **source_out, TokenArray
 
     if (expression == NULL || parser.had_error) {
         free_expr(expression);
-        free_token_array(&scanner.tokens);
-        free(source);
+        free_token_array(tokens_out);
+        free(*source_out);
         return 65;
     }
 
-    *source_out = source;
-    *tokens_out = scanner.tokens;
     *expression_out = expression;
+    return 0;
+}
+
+int parse_file_to_statements(const char *filename, char **source_out, TokenArray *tokens_out, StmtArray *statements_out) {
+    statements_out->items = NULL;
+    statements_out->count = 0;
+    statements_out->capacity = 0;
+
+    int scan_exit_code = scan_file_to_tokens(filename, source_out, tokens_out);
+    if (scan_exit_code != 0) {
+        return scan_exit_code;
+    }
+
+    Parser parser = {
+        .tokens = tokens_out,
+        .current = 0,
+        .had_error = 0,
+    };
+
+    while (!parser_is_at_end(&parser)) {
+        Stmt *statement = parse_statement(&parser);
+        if (statement == NULL) {
+            break;
+        }
+
+        append_stmt(statements_out, statement);
+    }
+
+    if (parser.had_error) {
+        free_stmt_array(statements_out);
+        free_token_array(tokens_out);
+        free(*source_out);
+        return 65;
+    }
+
     return 0;
 }
 
@@ -1447,4 +1623,56 @@ void print_value(Value value) {
             printf("%.*s", (int) value.as.string.length, value.as.string.start);
             return;
     }
+}
+
+int interpret_statement(const Stmt *stmt) {
+    int had_runtime_error = 0;
+    Value value;
+
+    switch (stmt->type) {
+        case STMT_EXPRESSION:
+            value = evaluate_expr(stmt->as.expression.expression, &had_runtime_error);
+            free_value(&value);
+            return had_runtime_error ? 70 : 0;
+        case STMT_PRINT:
+            value = evaluate_expr(stmt->as.print.expression, &had_runtime_error);
+            if (had_runtime_error) {
+                free_value(&value);
+                return 70;
+            }
+            print_value(value);
+            printf("\n");
+            free_value(&value);
+            return 0;
+    }
+
+    return 70;
+}
+
+int interpret_statements(const StmtArray *statements) {
+    for (size_t i = 0; i < statements->count; i++) {
+        int exit_code = interpret_statement(statements->items[i]);
+        if (exit_code != 0) {
+            return exit_code;
+        }
+    }
+
+    return 0;
+}
+
+int run_run_command(const char *filename) {
+    char *source = NULL;
+    TokenArray tokens = {0};
+    StmtArray statements = {0};
+    int exit_code = parse_file_to_statements(filename, &source, &tokens, &statements);
+    if (exit_code != 0) {
+        return exit_code;
+    }
+
+    exit_code = interpret_statements(&statements);
+
+    free_stmt_array(&statements);
+    free_token_array(&tokens);
+    free(source);
+    return exit_code;
 }
