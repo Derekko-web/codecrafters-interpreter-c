@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 typedef enum {
@@ -175,10 +176,11 @@ typedef struct {
     Value value;
 } EnvironmentEntry;
 
-typedef struct {
+typedef struct Environment {
     EnvironmentEntry *items;
     size_t count;
     size_t capacity;
+    struct Environment *enclosing;
 } Environment;
 
 typedef struct {
@@ -195,6 +197,7 @@ void append_token(TokenArray *tokens, Token token);
 void free_stmt_array(StmtArray *statements);
 void append_stmt(StmtArray *statements, Stmt *stmt);
 void init_environment(Environment *environment);
+void init_enclosed_environment(Environment *environment, Environment *enclosing);
 void free_environment(Environment *environment);
 void init_scanner(Scanner *scanner, const char *source);
 int scan_tokens(Scanner *scanner);
@@ -273,6 +276,7 @@ char *copy_string_slice(const char *start, size_t length);
 Value clone_value(Value value);
 Value concatenate_strings(Value left, Value right);
 void free_value(Value *value);
+void runtime_error(int line, const char *format, ...);
 int find_environment_entry(const Environment *environment, const char *name, size_t length);
 void define_variable(Environment *environment, Token name, Value value);
 Value get_variable(const Environment *environment, Token name, int *had_runtime_error);
@@ -484,6 +488,12 @@ void init_environment(Environment *environment) {
     environment->items = NULL;
     environment->count = 0;
     environment->capacity = 0;
+    environment->enclosing = NULL;
+}
+
+void init_enclosed_environment(Environment *environment, Environment *enclosing) {
+    init_environment(environment);
+    environment->enclosing = enclosing;
 }
 
 void free_environment(Environment *environment) {
@@ -496,6 +506,7 @@ void free_environment(Environment *environment) {
     environment->items = NULL;
     environment->count = 0;
     environment->capacity = 0;
+    environment->enclosing = NULL;
 }
 
 void init_scanner(Scanner *scanner, const char *source) {
@@ -1550,7 +1561,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                 case TOKEN_MINUS:
                     if (right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operand must be a number.\n", expr->as.unary.operator_token.line);
+                        runtime_error(expr->as.unary.operator_token.line, "Operand must be a number.");
                         *had_runtime_error = 1;
                         free_value(&right);
                         return make_nil_value();
@@ -1597,7 +1608,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                 case TOKEN_GREATER:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        runtime_error(expr->as.binary.operator_token.line, "Operands must be numbers.");
                         *had_runtime_error = 1;
                         free_value(&left);
                         free_value(&right);
@@ -1611,7 +1622,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                 case TOKEN_GREATER_EQUAL:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        runtime_error(expr->as.binary.operator_token.line, "Operands must be numbers.");
                         *had_runtime_error = 1;
                         free_value(&left);
                         free_value(&right);
@@ -1625,7 +1636,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                 case TOKEN_LESS:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        runtime_error(expr->as.binary.operator_token.line, "Operands must be numbers.");
                         *had_runtime_error = 1;
                         free_value(&left);
                         free_value(&right);
@@ -1639,7 +1650,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                 case TOKEN_LESS_EQUAL:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        runtime_error(expr->as.binary.operator_token.line, "Operands must be numbers.");
                         *had_runtime_error = 1;
                         free_value(&left);
                         free_value(&right);
@@ -1653,7 +1664,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                 case TOKEN_MINUS:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        runtime_error(expr->as.binary.operator_token.line, "Operands must be numbers.");
                         *had_runtime_error = 1;
                         free_value(&left);
                         free_value(&right);
@@ -1673,7 +1684,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                         return result;
                     }
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be two numbers or two strings.\n", expr->as.binary.operator_token.line);
+                        runtime_error(expr->as.binary.operator_token.line, "Operands must be two numbers or two strings.");
                         *had_runtime_error = 1;
                         free_value(&left);
                         free_value(&right);
@@ -1687,7 +1698,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                 case TOKEN_SLASH:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        runtime_error(expr->as.binary.operator_token.line, "Operands must be numbers.");
                         *had_runtime_error = 1;
                         free_value(&left);
                         free_value(&right);
@@ -1701,7 +1712,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                 case TOKEN_STAR:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        runtime_error(expr->as.binary.operator_token.line, "Operands must be numbers.");
                         *had_runtime_error = 1;
                         free_value(&left);
                         free_value(&right);
@@ -1738,7 +1749,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
         }
     }
 
-    fprintf(stderr, "Runtime error: Unsupported expression.\n");
+    runtime_error(0, "Unsupported expression.");
     *had_runtime_error = 1;
     return make_nil_value();
 }
@@ -1828,6 +1839,14 @@ void free_value(Value *value) {
     *value = make_nil_value();
 }
 
+void runtime_error(int line, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fprintf(stderr, "\n[line %d]\n", line);
+}
+
 int find_environment_entry(const Environment *environment, const char *name, size_t length) {
     if (environment == NULL) {
         return -1;
@@ -1866,27 +1885,31 @@ void define_variable(Environment *environment, Token name, Value value) {
 }
 
 Value get_variable(const Environment *environment, Token name, int *had_runtime_error) {
-    int index = find_environment_entry(environment, name.start, name.length);
-    if (index < 0) {
-        fprintf(stderr, "[line %d] Runtime error: Undefined variable '%.*s'.\n", name.line, (int) name.length, name.start);
-        *had_runtime_error = 1;
-        return make_nil_value();
+    for (const Environment *current = environment; current != NULL; current = current->enclosing) {
+        int index = find_environment_entry(current, name.start, name.length);
+        if (index >= 0) {
+            return clone_value(current->items[index].value);
+        }
     }
 
-    return clone_value(environment->items[index].value);
+    runtime_error(name.line, "Undefined variable '%.*s'.", (int) name.length, name.start);
+    *had_runtime_error = 1;
+    return make_nil_value();
 }
 
 int assign_variable(Environment *environment, Token name, Value value, int *had_runtime_error) {
-    int index = find_environment_entry(environment, name.start, name.length);
-    if (index < 0) {
-        fprintf(stderr, "[line %d] Runtime error: Undefined variable '%.*s'.\n", name.line, (int) name.length, name.start);
-        *had_runtime_error = 1;
-        return 0;
+    for (Environment *current = environment; current != NULL; current = current->enclosing) {
+        int index = find_environment_entry(current, name.start, name.length);
+        if (index >= 0) {
+            free_value(&current->items[index].value);
+            current->items[index].value = clone_value(value);
+            return 1;
+        }
     }
 
-    free_value(&environment->items[index].value);
-    environment->items[index].value = clone_value(value);
-    return 1;
+    runtime_error(name.line, "Undefined variable '%.*s'.", (int) name.length, name.start);
+    *had_runtime_error = 1;
+    return 0;
 }
 
 int is_truthy(Value value) {
@@ -1975,8 +1998,13 @@ int interpret_statement(const Stmt *stmt, Environment *environment) {
             define_variable(environment, stmt->as.var.name, value);
             free_value(&value);
             return 0;
-        case STMT_BLOCK:
-            return interpret_statements(&stmt->as.block.statements, environment);
+        case STMT_BLOCK: {
+            Environment block_environment;
+            init_enclosed_environment(&block_environment, environment);
+            int exit_code = interpret_statements(&stmt->as.block.statements, &block_environment);
+            free_environment(&block_environment);
+            return exit_code;
+        }
     }
 
     return 70;
