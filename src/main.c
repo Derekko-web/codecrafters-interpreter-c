@@ -240,6 +240,7 @@ int is_alphanumeric(char c);
 Expr *parse_expression(Parser *parser);
 Expr *parse_assignment(Parser *parser);
 Expr *parse_or(Parser *parser);
+Expr *parse_and(Parser *parser);
 Expr *parse_equality(Parser *parser);
 Expr *parse_comparison(Parser *parser);
 Expr *parse_term(Parser *parser);
@@ -915,12 +916,32 @@ Expr *parse_assignment(Parser *parser) {
 }
 
 Expr *parse_or(Parser *parser) {
-    Expr *expression = parse_equality(parser);
+    Expr *expression = parse_and(parser);
     if (expression == NULL) {
         return NULL;
     }
 
     while (parser_match(parser, &(TokenType){TOKEN_OR}, 1)) {
+        Token operator_token = parser_previous(parser);
+        Expr *right = parse_and(parser);
+        if (right == NULL) {
+            free_expr(expression);
+            return NULL;
+        }
+
+        expression = new_logical_expr(expression, operator_token, right);
+    }
+
+    return expression;
+}
+
+Expr *parse_and(Parser *parser) {
+    Expr *expression = parse_equality(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
+
+    while (parser_match(parser, &(TokenType){TOKEN_AND}, 1)) {
         Token operator_token = parser_previous(parser);
         Expr *right = parse_equality(parser);
         if (right == NULL) {
@@ -1872,6 +1893,12 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
             switch (expr->as.logical.operator_token.type) {
                 case TOKEN_OR:
                     if (is_truthy(left)) {
+                        return left;
+                    }
+                    free_value(&left);
+                    return evaluate_expr(expr->as.logical.right, environment, had_runtime_error);
+                case TOKEN_AND:
+                    if (!is_truthy(left)) {
                         return left;
                     }
                     free_value(&left);
