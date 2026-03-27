@@ -74,7 +74,8 @@ typedef enum {
     EXPR_LITERAL,
     EXPR_UNARY,
     EXPR_VARIABLE,
-    EXPR_ASSIGN
+    EXPR_ASSIGN,
+    EXPR_LOGICAL
 } ExprType;
 
 typedef enum {
@@ -136,6 +137,11 @@ struct Expr {
             Token name;
             Expr *value;
         } assign;
+        struct {
+            Expr *left;
+            Token operator_token;
+            Expr *right;
+        } logical;
     } as;
 };
 
@@ -233,6 +239,7 @@ int is_alpha(char c);
 int is_alphanumeric(char c);
 Expr *parse_expression(Parser *parser);
 Expr *parse_assignment(Parser *parser);
+Expr *parse_or(Parser *parser);
 Expr *parse_equality(Parser *parser);
 Expr *parse_comparison(Parser *parser);
 Expr *parse_term(Parser *parser);
@@ -255,6 +262,7 @@ Expr *new_string_literal_expr(const char *start, size_t length);
 Expr *new_unary_expr(Token operator_token, Expr *right);
 Expr *new_variable_expr(Token name);
 Expr *new_assign_expr(Token name, Expr *value);
+Expr *new_logical_expr(Expr *left, Token operator_token, Expr *right);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
@@ -878,7 +886,7 @@ Expr *parse_expression(Parser *parser) {
 }
 
 Expr *parse_assignment(Parser *parser) {
-    Expr *expression = parse_equality(parser);
+    Expr *expression = parse_or(parser);
     if (expression == NULL) {
         return NULL;
     }
@@ -901,6 +909,26 @@ Expr *parse_assignment(Parser *parser) {
         free_expr(expression);
         free_expr(value);
         return NULL;
+    }
+
+    return expression;
+}
+
+Expr *parse_or(Parser *parser) {
+    Expr *expression = parse_equality(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
+
+    while (parser_match(parser, &(TokenType){TOKEN_OR}, 1)) {
+        Token operator_token = parser_previous(parser);
+        Expr *right = parse_equality(parser);
+        if (right == NULL) {
+            free_expr(expression);
+            return NULL;
+        }
+
+        expression = new_logical_expr(expression, operator_token, right);
     }
 
     return expression;
@@ -1278,6 +1306,15 @@ Expr *new_assign_expr(Token name, Expr *value) {
     return expr;
 }
 
+Expr *new_logical_expr(Expr *left, Token operator_token, Expr *right) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_LOGICAL;
+    expr->as.logical.left = left;
+    expr->as.logical.operator_token = operator_token;
+    expr->as.logical.right = right;
+    return expr;
+}
+
 Stmt *new_expression_stmt(Expr *expression) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_EXPRESSION;
@@ -1334,6 +1371,10 @@ void free_expr(Expr *expr) {
             break;
         case EXPR_ASSIGN:
             free_expr(expr->as.assign.value);
+            break;
+        case EXPR_LOGICAL:
+            free_expr(expr->as.logical.left);
+            free_expr(expr->as.logical.right);
             break;
         case EXPR_VARIABLE:
         case EXPR_LITERAL:
@@ -1483,6 +1524,18 @@ void print_expr(const Expr *expr) {
             printf("(= %.*s ", (int) expr->as.assign.name.length, expr->as.assign.name.start);
             print_expr(expr->as.assign.value);
             printf(")");
+            return;
+        }
+        case EXPR_LOGICAL: {
+            const Expr *expressions[] = {
+                expr->as.logical.left,
+                expr->as.logical.right,
+            };
+            print_parenthesized(
+                expr->as.logical.operator_token.start,
+                expr->as.logical.operator_token.length,
+                expressions,
+                sizeof(expressions) / sizeof(expressions[0]));
             return;
         }
     }
@@ -1808,6 +1861,26 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
             }
 
             return value;
+        }
+        case EXPR_LOGICAL: {
+            Value left = evaluate_expr(expr->as.logical.left, environment, had_runtime_error);
+            if (*had_runtime_error) {
+                free_value(&left);
+                return make_nil_value();
+            }
+
+            switch (expr->as.logical.operator_token.type) {
+                case TOKEN_OR:
+                    if (is_truthy(left)) {
+                        return left;
+                    }
+                    free_value(&left);
+                    return evaluate_expr(expr->as.logical.right, environment, had_runtime_error);
+                default:
+                    free_value(&left);
+                    break;
+            }
+            break;
         }
     }
 
