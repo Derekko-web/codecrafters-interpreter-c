@@ -92,13 +92,15 @@ typedef enum {
     VALUE_BOOL,
     VALUE_NUMBER,
     VALUE_STRING,
-    VALUE_NATIVE_FUNCTION
+    VALUE_NATIVE_FUNCTION,
+    VALUE_FUNCTION
 } ValueType;
 
 typedef enum {
     STMT_EXPRESSION,
     STMT_PRINT,
     STMT_VAR,
+    STMT_FUNCTION,
     STMT_BLOCK,
     STMT_IF,
     STMT_WHILE
@@ -118,6 +120,7 @@ typedef struct StmtArray {
 } StmtArray;
 typedef struct NativeFunction NativeFunction;
 typedef struct Value Value;
+typedef struct Environment Environment;
 
 struct Expr {
     ExprType type;
@@ -175,6 +178,11 @@ struct Stmt {
             Expr *initializer;
         } var;
         struct {
+            Token name;
+            TokenArray parameters;
+            StmtArray body;
+        } function;
+        struct {
             StmtArray statements;
         } block;
         struct {
@@ -200,6 +208,10 @@ struct Value {
             int owns_memory;
         } string;
         const NativeFunction *native_function;
+        struct {
+            const Stmt *declaration;
+            Environment *closure;
+        } function;
     } as;
 };
 
@@ -215,12 +227,12 @@ typedef struct {
     Value value;
 } EnvironmentEntry;
 
-typedef struct Environment {
+struct Environment {
     EnvironmentEntry *items;
     size_t count;
     size_t capacity;
-    struct Environment *enclosing;
-} Environment;
+    Environment *enclosing;
+};
 
 typedef struct {
     TokenArray *tokens;
@@ -280,8 +292,10 @@ Expr *parse_call(Parser *parser);
 Expr *parse_finish_call(Parser *parser, Expr *callee);
 Expr *parse_primary(Parser *parser);
 Stmt *parse_declaration(Parser *parser);
+Stmt *parse_function_declaration(Parser *parser);
 Stmt *parse_statement(Parser *parser);
 Stmt *parse_var_declaration(Parser *parser);
+int parse_block_contents(Parser *parser, StmtArray *statements_out);
 Stmt *parse_block_statement(Parser *parser);
 Stmt *parse_if_statement(Parser *parser);
 Stmt *parse_for_statement(Parser *parser);
@@ -302,6 +316,7 @@ Expr *new_call_expr(Expr *callee, Token paren, ExprArray arguments);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
+Stmt *new_function_stmt(Token name, TokenArray parameters, StmtArray body);
 Stmt *new_block_stmt(StmtArray statements);
 Stmt *new_if_stmt(Expr *condition, Stmt *then_branch, Stmt *else_branch);
 Stmt *new_while_stmt(Expr *condition, Stmt *body);
@@ -326,6 +341,7 @@ Value make_boolean_value(int boolean);
 Value make_number_value(double number);
 Value make_string_value(const char *start, size_t length);
 Value make_native_function_value(const NativeFunction *native_function);
+Value make_function_value(const Stmt *declaration, Environment *closure);
 char *copy_string_slice(const char *start, size_t length);
 Value clone_value(Value value);
 Value concatenate_strings(Value left, Value right);
@@ -1236,11 +1252,64 @@ Expr *parse_primary(Parser *parser) {
 }
 
 Stmt *parse_declaration(Parser *parser) {
+    if (parser_match(parser, &(TokenType){TOKEN_FUN}, 1)) {
+        return parse_function_declaration(parser);
+    }
+
     if (parser_match(parser, &(TokenType){TOKEN_VAR}, 1)) {
         return parse_var_declaration(parser);
     }
 
     return parse_statement(parser);
+}
+
+Stmt *parse_function_declaration(Parser *parser) {
+    Token name = parser_consume(parser, TOKEN_IDENTIFIER, "Expect function name.");
+    if (parser->had_error) {
+        return NULL;
+    }
+
+    parser_consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after function name.");
+    if (parser->had_error) {
+        return NULL;
+    }
+
+    TokenArray parameters = {0};
+    if (!parser_check(parser, TOKEN_RIGHT_PAREN)) {
+        do {
+            if (parameters.count >= 255) {
+                parser_error(parser, parser_peek(parser), "Can't have more than 255 parameters.");
+            }
+
+            Token parameter = parser_consume(parser, TOKEN_IDENTIFIER, "Expect parameter name.");
+            if (parser->had_error) {
+                free_token_array(&parameters);
+                return NULL;
+            }
+
+            append_token(&parameters, parameter);
+        } while (parser_match(parser, &(TokenType){TOKEN_COMMA}, 1));
+    }
+
+    parser_consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
+    if (parser->had_error) {
+        free_token_array(&parameters);
+        return NULL;
+    }
+
+    parser_consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before function body.");
+    if (parser->had_error) {
+        free_token_array(&parameters);
+        return NULL;
+    }
+
+    StmtArray body = {0};
+    if (!parse_block_contents(parser, &body)) {
+        free_token_array(&parameters);
+        return NULL;
+    }
+
+    return new_function_stmt(name, parameters, body);
 }
 
 Stmt *parse_statement(Parser *parser) {
@@ -1383,26 +1452,33 @@ Stmt *parse_var_declaration(Parser *parser) {
     return new_var_stmt(name, initializer);
 }
 
-Stmt *parse_block_statement(Parser *parser) {
-    StmtArray statements = {
-        .items = NULL,
-        .count = 0,
-        .capacity = 0,
-    };
+int parse_block_contents(Parser *parser, StmtArray *statements_out) {
+    statements_out->items = NULL;
+    statements_out->count = 0;
+    statements_out->capacity = 0;
 
     while (!parser_check(parser, TOKEN_RIGHT_BRACE) && !parser_is_at_end(parser)) {
         Stmt *statement = parse_declaration(parser);
         if (statement == NULL) {
-            free_stmt_array(&statements);
-            return NULL;
+            free_stmt_array(statements_out);
+            return 0;
         }
 
-        append_stmt(&statements, statement);
+        append_stmt(statements_out, statement);
     }
 
     parser_consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' .");
     if (parser->had_error) {
-        free_stmt_array(&statements);
+        free_stmt_array(statements_out);
+        return 0;
+    }
+
+    return 1;
+}
+
+Stmt *parse_block_statement(Parser *parser) {
+    StmtArray statements = {0};
+    if (!parse_block_contents(parser, &statements)) {
         return NULL;
     }
 
@@ -1624,6 +1700,15 @@ Stmt *new_var_stmt(Token name, Expr *initializer) {
     return stmt;
 }
 
+Stmt *new_function_stmt(Token name, TokenArray parameters, StmtArray body) {
+    Stmt *stmt = xmalloc(sizeof(Stmt));
+    stmt->type = STMT_FUNCTION;
+    stmt->as.function.name = name;
+    stmt->as.function.parameters = parameters;
+    stmt->as.function.body = body;
+    return stmt;
+}
+
 Stmt *new_block_stmt(StmtArray statements) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_BLOCK;
@@ -1697,6 +1782,10 @@ void free_stmt(Stmt *stmt) {
             break;
         case STMT_VAR:
             free_expr(stmt->as.var.initializer);
+            break;
+        case STMT_FUNCTION:
+            free_token_array(&stmt->as.function.parameters);
+            free_stmt_array(&stmt->as.function.body);
             break;
         case STMT_BLOCK:
             free_stmt_array(&stmt->as.block.statements);
@@ -2224,7 +2313,7 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                 }
             }
 
-            if (callee.type != VALUE_NATIVE_FUNCTION) {
+            if (callee.type != VALUE_NATIVE_FUNCTION && callee.type != VALUE_FUNCTION) {
                 runtime_error(expr->as.call.paren.line, "Can only call functions and classes.");
                 *had_runtime_error = 1;
                 for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
@@ -2235,23 +2324,62 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                 return make_nil_value();
             }
 
-            const NativeFunction *native_function = callee.as.native_function;
-            if ((size_t) native_function->arity != expr->as.call.arguments.count) {
-                runtime_error(
-                    expr->as.call.paren.line,
-                    "Expected %d arguments but got %zu.",
-                    native_function->arity,
-                    expr->as.call.arguments.count);
-                *had_runtime_error = 1;
-                for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
-                    free_value(&arguments[i]);
+            Value result;
+            if (callee.type == VALUE_NATIVE_FUNCTION) {
+                const NativeFunction *native_function = callee.as.native_function;
+                if ((size_t) native_function->arity != expr->as.call.arguments.count) {
+                    runtime_error(
+                        expr->as.call.paren.line,
+                        "Expected %d arguments but got %zu.",
+                        native_function->arity,
+                        expr->as.call.arguments.count);
+                    *had_runtime_error = 1;
+                    for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
+                        free_value(&arguments[i]);
+                    }
+                    free(arguments);
+                    free_value(&callee);
+                    return make_nil_value();
                 }
-                free(arguments);
-                free_value(&callee);
-                return make_nil_value();
-            }
 
-            Value result = native_function->function((int) expr->as.call.arguments.count, arguments);
+                result = native_function->function((int) expr->as.call.arguments.count, arguments);
+            } else {
+                const Stmt *declaration = callee.as.function.declaration;
+                if (declaration->as.function.parameters.count != expr->as.call.arguments.count) {
+                    runtime_error(
+                        expr->as.call.paren.line,
+                        "Expected %zu arguments but got %zu.",
+                        declaration->as.function.parameters.count,
+                        expr->as.call.arguments.count);
+                    *had_runtime_error = 1;
+                    for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
+                        free_value(&arguments[i]);
+                    }
+                    free(arguments);
+                    free_value(&callee);
+                    return make_nil_value();
+                }
+
+                Environment function_environment;
+                init_enclosed_environment(&function_environment, callee.as.function.closure);
+                for (size_t i = 0; i < declaration->as.function.parameters.count; i++) {
+                    define_variable(&function_environment, declaration->as.function.parameters.items[i], arguments[i]);
+                }
+
+                int exit_code = interpret_statements(&declaration->as.function.body, &function_environment);
+                free_environment(&function_environment);
+                if (exit_code != 0) {
+                    *had_runtime_error = 1;
+                    for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
+                        free_value(&arguments[i]);
+                    }
+                    free(arguments);
+                    free_value(&callee);
+                    return make_nil_value();
+                }
+
+                result = make_nil_value();
+            }
             for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
                 free_value(&arguments[i]);
             }
@@ -2305,6 +2433,15 @@ Value make_native_function_value(const NativeFunction *native_function) {
     return value;
 }
 
+Value make_function_value(const Stmt *declaration, Environment *closure) {
+    Value value = {
+        .type = VALUE_FUNCTION,
+        .as.function.declaration = declaration,
+        .as.function.closure = closure,
+    };
+    return value;
+}
+
 char *copy_string_slice(const char *start, size_t length) {
     char *buffer = xmalloc(length + 1);
     memcpy(buffer, start, length);
@@ -2332,6 +2469,8 @@ Value clone_value(Value value) {
         }
         case VALUE_NATIVE_FUNCTION:
             return make_native_function_value(value.as.native_function);
+        case VALUE_FUNCTION:
+            return make_function_value(value.as.function.declaration, value.as.function.closure);
     }
 
     return make_nil_value();
@@ -2449,6 +2588,7 @@ int is_truthy(Value value) {
         case VALUE_NUMBER:
         case VALUE_STRING:
         case VALUE_NATIVE_FUNCTION:
+        case VALUE_FUNCTION:
             return 1;
     }
 
@@ -2472,6 +2612,9 @@ int values_equal(Value left, Value right) {
                    strncmp(left.as.string.start, right.as.string.start, left.as.string.length) == 0;
         case VALUE_NATIVE_FUNCTION:
             return left.as.native_function == right.as.native_function;
+        case VALUE_FUNCTION:
+            return left.as.function.declaration == right.as.function.declaration &&
+                   left.as.function.closure == right.as.function.closure;
     }
 
     return 0;
@@ -2496,6 +2639,12 @@ void print_value(Value value) {
             return;
         case VALUE_NATIVE_FUNCTION:
             printf("<native fn>");
+            return;
+        case VALUE_FUNCTION:
+            printf(
+                "<fn %.*s>",
+                (int) value.as.function.declaration->as.function.name.length,
+                value.as.function.declaration->as.function.name.start);
             return;
     }
 }
@@ -2530,6 +2679,11 @@ int interpret_statement(const Stmt *stmt, Environment *environment) {
                 }
             }
             define_variable(environment, stmt->as.var.name, value);
+            free_value(&value);
+            return 0;
+        case STMT_FUNCTION:
+            value = make_function_value(stmt, environment);
+            define_variable(environment, stmt->as.function.name, value);
             free_value(&value);
             return 0;
         case STMT_BLOCK: {
