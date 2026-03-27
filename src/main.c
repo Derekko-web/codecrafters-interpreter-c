@@ -244,6 +244,7 @@ struct Value {
         struct {
             const Stmt *declaration;
             Environment *closure;
+            int is_initializer;
         } function;
     } as;
 };
@@ -310,7 +311,9 @@ typedef struct {
 
 typedef enum {
     RESOLVER_FUNCTION_NONE,
-    RESOLVER_FUNCTION_FUNCTION
+    RESOLVER_FUNCTION_FUNCTION,
+    RESOLVER_FUNCTION_METHOD,
+    RESOLVER_FUNCTION_INITIALIZER
 } ResolverFunctionType;
 
 typedef enum {
@@ -461,7 +464,7 @@ InstanceObject *retain_instance_object(InstanceObject *instance_object);
 void release_instance_object(InstanceObject *instance_object);
 Value make_instance_value(InstanceObject *instance_object);
 Value make_native_function_value(const NativeFunction *native_function);
-Value make_function_value(const Stmt *declaration, Environment *closure);
+Value make_function_value(const Stmt *declaration, Environment *closure, int is_initializer);
 Value bind_method(Value method, InstanceObject *instance_object);
 char *copy_string_slice(const char *start, size_t length);
 Value clone_value(Value value);
@@ -475,6 +478,15 @@ Value get_instance_field(const InstanceObject *instance_object, Token name, int 
 int find_class_method(const ClassObject *class_object, const char *name, size_t length);
 void set_class_method(ClassObject *class_object, Token name, Value value);
 int find_environment_entry(const Environment *environment, const char *name, size_t length);
+int is_initializer_name(Token name);
+Value get_bound_this_value(Value function, int *had_runtime_error);
+int call_function_value(
+    Value callee,
+    size_t argument_count,
+    const Value *arguments,
+    int line,
+    int *had_runtime_error,
+    Value *result_out);
 void define_variable(Environment *environment, Token name, Value value);
 Value get_resolved_variable(const Environment *environment, size_t distance, Token name, int *had_runtime_error);
 Value get_variable(const Environment *environment, Token name, int *had_runtime_error);
@@ -2607,7 +2619,12 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
                 resolver_define(resolver, this_token);
 
                 for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
-                    resolver_resolve_function(resolver, stmt->as.class_statement.methods.items[i], RESOLVER_FUNCTION_FUNCTION);
+                    const Stmt *method = stmt->as.class_statement.methods.items[i];
+                    ResolverFunctionType function_type =
+                        is_initializer_name(method->as.function.name)
+                            ? RESOLVER_FUNCTION_INITIALIZER
+                            : RESOLVER_FUNCTION_METHOD;
+                    resolver_resolve_function(resolver, method, function_type);
                 }
 
                 resolver_end_scope(resolver);
@@ -2622,6 +2639,10 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
         case STMT_RETURN:
             if (resolver->current_function == RESOLVER_FUNCTION_NONE) {
                 resolver_error(resolver, stmt->as.return_statement.keyword, "Can't return from top-level code.");
+            }
+            if (resolver->current_function == RESOLVER_FUNCTION_INITIALIZER &&
+                stmt->as.return_statement.value != NULL) {
+                resolver_error(resolver, stmt->as.return_statement.keyword, "Can't return a value from an initializer.");
             }
             resolver_resolve_expr(resolver, stmt->as.return_statement.value);
             return;
@@ -2956,7 +2977,31 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
 
             Value result;
             if (callee.type == VALUE_CLASS) {
-                if (expr->as.call.arguments.count != 0) {
+                result = make_instance_value(new_instance_object(callee.as.class_object));
+
+                int initializer_index = find_class_method(callee.as.class_object, "init", strlen("init"));
+                if (initializer_index >= 0) {
+                    Value initializer = bind_method(callee.as.class_object->methods[initializer_index].value, result.as.instance_object);
+                    Value initializer_result = make_nil_value();
+                    int call_succeeded = call_function_value(
+                        initializer,
+                        expr->as.call.arguments.count,
+                        arguments,
+                        expr->as.call.paren.line,
+                        had_runtime_error,
+                        &initializer_result);
+                    free_value(&initializer);
+                    free_value(&initializer_result);
+                    if (!call_succeeded) {
+                        for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
+                            free_value(&arguments[i]);
+                        }
+                        free(arguments);
+                        free_value(&callee);
+                        free_value(&result);
+                        return make_nil_value();
+                    }
+                } else if (expr->as.call.arguments.count != 0) {
                     runtime_error(
                         expr->as.call.paren.line,
                         "Expected 0 arguments but got %zu.",
@@ -2967,10 +3012,9 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     }
                     free(arguments);
                     free_value(&callee);
+                    free_value(&result);
                     return make_nil_value();
                 }
-
-                result = make_instance_value(new_instance_object(callee.as.class_object));
             } else if (callee.type == VALUE_NATIVE_FUNCTION) {
                 const NativeFunction *native_function = callee.as.native_function;
                 if ((size_t) native_function->arity != expr->as.call.arguments.count) {
@@ -2990,13 +3034,13 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
 
                 result = native_function->function((int) expr->as.call.arguments.count, arguments);
             } else {
-                const Stmt *declaration = callee.as.function.declaration;
-                if (declaration->as.function.parameters.count != expr->as.call.arguments.count) {
-                    runtime_error(
+                if (!call_function_value(
+                        callee,
+                        expr->as.call.arguments.count,
+                        arguments,
                         expr->as.call.paren.line,
-                        "Expected %zu arguments but got %zu.",
-                        declaration->as.function.parameters.count,
-                        expr->as.call.arguments.count);
+                        had_runtime_error,
+                        &result)) {
                     *had_runtime_error = 1;
                     for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
                         free_value(&arguments[i]);
@@ -3004,36 +3048,6 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     free(arguments);
                     free_value(&callee);
                     return make_nil_value();
-                }
-
-                Environment *function_environment = new_enclosed_environment(callee.as.function.closure);
-                for (size_t i = 0; i < declaration->as.function.parameters.count; i++) {
-                    define_variable(function_environment, declaration->as.function.parameters.items[i], arguments[i]);
-                }
-
-                int did_return = 0;
-                Value return_value = make_nil_value();
-                int exit_code = interpret_statements(
-                    &declaration->as.function.body,
-                    function_environment,
-                    &did_return,
-                    &return_value);
-                release_environment(function_environment);
-                if (exit_code != 0) {
-                    *had_runtime_error = 1;
-                    for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
-                        free_value(&arguments[i]);
-                    }
-                    free(arguments);
-                    free_value(&callee);
-                    return make_nil_value();
-                }
-
-                if (did_return) {
-                    result = return_value;
-                } else {
-                    result = make_nil_value();
-                    free_value(&return_value);
                 }
             }
             for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
@@ -3224,11 +3238,12 @@ Value make_native_function_value(const NativeFunction *native_function) {
     return value;
 }
 
-Value make_function_value(const Stmt *declaration, Environment *closure) {
+Value make_function_value(const Stmt *declaration, Environment *closure, int is_initializer) {
     Value value = {
         .type = VALUE_FUNCTION,
         .as.function.declaration = declaration,
         .as.function.closure = retain_environment(closure),
+        .as.function.is_initializer = is_initializer,
     };
     return value;
 }
@@ -3246,9 +3261,86 @@ Value bind_method(Value method, InstanceObject *instance_object) {
     define_variable(bound_environment, this_token, instance_value);
     free_value(&instance_value);
 
-    Value bound_method = make_function_value(method.as.function.declaration, bound_environment);
+    Value bound_method = make_function_value(
+        method.as.function.declaration,
+        bound_environment,
+        method.as.function.is_initializer);
     release_environment(bound_environment);
     return bound_method;
+}
+
+int is_initializer_name(Token name) {
+    return name.length == strlen("init") && strncmp(name.start, "init", strlen("init")) == 0;
+}
+
+Value get_bound_this_value(Value function, int *had_runtime_error) {
+    if (function.type != VALUE_FUNCTION || function.as.function.closure == NULL) {
+        *had_runtime_error = 1;
+        runtime_error(0, "Missing bound receiver.");
+        return make_nil_value();
+    }
+
+    int index = find_environment_entry(function.as.function.closure, "this", strlen("this"));
+    if (index >= 0) {
+        return clone_value(function.as.function.closure->items[index].value);
+    }
+
+    *had_runtime_error = 1;
+    runtime_error(0, "Missing bound receiver.");
+    return make_nil_value();
+}
+
+int call_function_value(
+    Value callee,
+    size_t argument_count,
+    const Value *arguments,
+    int line,
+    int *had_runtime_error,
+    Value *result_out) {
+    const Stmt *declaration = callee.as.function.declaration;
+    if (declaration->as.function.parameters.count != argument_count) {
+        runtime_error(
+            line,
+            "Expected %zu arguments but got %zu.",
+            declaration->as.function.parameters.count,
+            argument_count);
+        *had_runtime_error = 1;
+        return 0;
+    }
+
+    Environment *function_environment = new_enclosed_environment(callee.as.function.closure);
+    for (size_t i = 0; i < declaration->as.function.parameters.count; i++) {
+        define_variable(function_environment, declaration->as.function.parameters.items[i], arguments[i]);
+    }
+
+    int did_return = 0;
+    Value return_value = make_nil_value();
+    int exit_code = interpret_statements(
+        &declaration->as.function.body,
+        function_environment,
+        &did_return,
+        &return_value);
+    release_environment(function_environment);
+    if (exit_code != 0) {
+        *had_runtime_error = 1;
+        free_value(&return_value);
+        return 0;
+    }
+
+    if (callee.as.function.is_initializer) {
+        free_value(&return_value);
+        *result_out = get_bound_this_value(callee, had_runtime_error);
+        return !(*had_runtime_error);
+    }
+
+    if (did_return) {
+        *result_out = return_value;
+    } else {
+        *result_out = make_nil_value();
+        free_value(&return_value);
+    }
+
+    return 1;
 }
 
 char *copy_string_slice(const char *start, size_t length) {
@@ -3283,7 +3375,10 @@ Value clone_value(Value value) {
         case VALUE_NATIVE_FUNCTION:
             return make_native_function_value(value.as.native_function);
         case VALUE_FUNCTION:
-            return make_function_value(value.as.function.declaration, value.as.function.closure);
+            return make_function_value(
+                value.as.function.declaration,
+                value.as.function.closure,
+                value.as.function.is_initializer);
     }
 
     return make_nil_value();
@@ -3565,7 +3660,8 @@ int values_equal(Value left, Value right) {
             return left.as.native_function == right.as.native_function;
         case VALUE_FUNCTION:
             return left.as.function.declaration == right.as.function.declaration &&
-                   left.as.function.closure == right.as.function.closure;
+                   left.as.function.closure == right.as.function.closure &&
+                   left.as.function.is_initializer == right.as.function.is_initializer;
     }
 
     return 0;
@@ -3644,7 +3740,7 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
                 stmt->as.class_statement.name.length));
             for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
                 const Stmt *method = stmt->as.class_statement.methods.items[i];
-                Value method_value = make_function_value(method, environment);
+                Value method_value = make_function_value(method, environment, is_initializer_name(method->as.function.name));
                 set_class_method(value.as.class_object, method->as.function.name, method_value);
                 free_value(&method_value);
             }
@@ -3652,7 +3748,7 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
             free_value(&value);
             return 0;
         case STMT_FUNCTION:
-            value = make_function_value(stmt, environment);
+            value = make_function_value(stmt, environment, 0);
             define_variable(environment, stmt->as.function.name, value);
             free_value(&value);
             return 0;
