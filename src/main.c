@@ -202,6 +202,7 @@ struct Stmt {
         } var;
         struct {
             Token name;
+            Expr *superclass;
             StmtArray methods;
         } class_statement;
         struct {
@@ -257,6 +258,7 @@ struct NativeFunction {
 
 struct ClassObject {
     char *name;
+    ClassObject *superclass;
     ClassMethodEntry *methods;
     size_t method_count;
     size_t method_capacity;
@@ -413,7 +415,7 @@ Expr *new_set_expr(Expr *object, Token name, Expr *value);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
-Stmt *new_class_stmt(Token name, StmtArray methods);
+Stmt *new_class_stmt(Token name, Expr *superclass, StmtArray methods);
 Stmt *new_function_stmt(Token name, TokenArray parameters, StmtArray body);
 Stmt *new_return_stmt(Token keyword, Expr *value);
 Stmt *new_block_stmt(StmtArray statements);
@@ -455,7 +457,7 @@ Value make_nil_value(void);
 Value make_boolean_value(int boolean);
 Value make_number_value(double number);
 Value make_string_value(const char *start, size_t length);
-ClassObject *new_class_object(const char *name, size_t length);
+ClassObject *new_class_object(const char *name, size_t length, ClassObject *superclass);
 ClassObject *retain_class_object(ClassObject *class_object);
 void release_class_object(ClassObject *class_object);
 Value make_class_value(ClassObject *class_object);
@@ -476,6 +478,7 @@ int find_instance_field(const InstanceObject *instance_object, const char *name,
 void set_instance_field(InstanceObject *instance_object, Token name, Value value);
 Value get_instance_field(const InstanceObject *instance_object, Token name, int *had_runtime_error);
 int find_class_method(const ClassObject *class_object, const char *name, size_t length);
+const Value *find_inherited_class_method(const ClassObject *class_object, const char *name, size_t length);
 void set_class_method(ClassObject *class_object, Token name, Value value);
 int find_environment_entry(const Environment *environment, const char *name, size_t length);
 int is_initializer_name(Token name);
@@ -1473,8 +1476,19 @@ Stmt *parse_class_declaration(Parser *parser) {
         return NULL;
     }
 
+    Expr *superclass = NULL;
+    if (parser_match(parser, &(TokenType){TOKEN_LESS}, 1)) {
+        Token superclass_name = parser_consume(parser, TOKEN_IDENTIFIER, "Expect superclass name.");
+        if (parser->had_error) {
+            return NULL;
+        }
+
+        superclass = new_variable_expr(superclass_name);
+    }
+
     parser_consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before class body.");
     if (parser->had_error) {
+        free_expr(superclass);
         return NULL;
     }
 
@@ -1482,6 +1496,7 @@ Stmt *parse_class_declaration(Parser *parser) {
     while (!parser_check(parser, TOKEN_RIGHT_BRACE) && !parser_is_at_end(parser)) {
         Stmt *method = parse_function_declaration(parser);
         if (method == NULL) {
+            free_expr(superclass);
             free_stmt_array(&methods);
             return NULL;
         }
@@ -1491,11 +1506,12 @@ Stmt *parse_class_declaration(Parser *parser) {
 
     parser_consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after class body.");
     if (parser->had_error) {
+        free_expr(superclass);
         free_stmt_array(&methods);
         return NULL;
     }
 
-    return new_class_stmt(name, methods);
+    return new_class_stmt(name, superclass, methods);
 }
 
 Stmt *parse_function_declaration(Parser *parser) {
@@ -1980,10 +1996,11 @@ Stmt *new_var_stmt(Token name, Expr *initializer) {
     return stmt;
 }
 
-Stmt *new_class_stmt(Token name, StmtArray methods) {
+Stmt *new_class_stmt(Token name, Expr *superclass, StmtArray methods) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_CLASS;
     stmt->as.class_statement.name = name;
+    stmt->as.class_statement.superclass = superclass;
     stmt->as.class_statement.methods = methods;
     return stmt;
 }
@@ -2087,6 +2104,7 @@ void free_stmt(Stmt *stmt) {
             free_expr(stmt->as.var.initializer);
             break;
         case STMT_CLASS:
+            free_expr(stmt->as.class_statement.superclass);
             free_stmt_array(&stmt->as.class_statement.methods);
             break;
         case STMT_FUNCTION:
@@ -2604,8 +2622,22 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
                 ResolverClassType enclosing_class = resolver->current_class;
                 resolver->current_class = RESOLVER_CLASS_CLASS;
 
+                if (stmt->as.class_statement.superclass != NULL &&
+                    stmt->as.class_statement.superclass->type == EXPR_VARIABLE &&
+                    stmt->as.class_statement.name.length == stmt->as.class_statement.superclass->as.variable.name.length &&
+                    strncmp(
+                        stmt->as.class_statement.name.start,
+                        stmt->as.class_statement.superclass->as.variable.name.start,
+                        stmt->as.class_statement.name.length) == 0) {
+                    resolver_error(
+                        resolver,
+                        stmt->as.class_statement.superclass->as.variable.name,
+                        "A class can't inherit from itself.");
+                }
+
                 resolver_declare(resolver, stmt->as.class_statement.name);
                 resolver_define(resolver, stmt->as.class_statement.name);
+                resolver_resolve_expr(resolver, stmt->as.class_statement.superclass);
 
                 resolver_begin_scope(resolver);
                 Token this_token = {
@@ -2979,9 +3011,9 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
             if (callee.type == VALUE_CLASS) {
                 result = make_instance_value(new_instance_object(callee.as.class_object));
 
-                int initializer_index = find_class_method(callee.as.class_object, "init", strlen("init"));
-                if (initializer_index >= 0) {
-                    Value initializer = bind_method(callee.as.class_object->methods[initializer_index].value, result.as.instance_object);
+                const Value *initializer_method = find_inherited_class_method(callee.as.class_object, "init", strlen("init"));
+                if (initializer_method != NULL) {
+                    Value initializer = bind_method(*initializer_method, result.as.instance_object);
                     Value initializer_result = make_nil_value();
                     int call_succeeded = call_function_value(
                         initializer,
@@ -3138,9 +3170,10 @@ Value make_string_value(const char *start, size_t length) {
     return value;
 }
 
-ClassObject *new_class_object(const char *name, size_t length) {
+ClassObject *new_class_object(const char *name, size_t length, ClassObject *superclass) {
     ClassObject *class_object = xmalloc(sizeof(ClassObject));
     class_object->name = copy_string_slice(name, length);
+    class_object->superclass = retain_class_object(superclass);
     class_object->methods = NULL;
     class_object->method_count = 0;
     class_object->method_capacity = 0;
@@ -3173,6 +3206,7 @@ void release_class_object(ClassObject *class_object) {
 
     free(class_object->methods);
     free(class_object->name);
+    release_class_object(class_object->superclass);
     free(class_object);
 }
 
@@ -3477,9 +3511,9 @@ Value get_instance_field(const InstanceObject *instance_object, Token name, int 
         return clone_value(instance_object->fields[index].value);
     }
 
-    index = find_class_method(instance_object->class_object, name.start, name.length);
-    if (index >= 0) {
-        return bind_method(instance_object->class_object->methods[index].value, (InstanceObject *) instance_object);
+    const Value *method = find_inherited_class_method(instance_object->class_object, name.start, name.length);
+    if (method != NULL) {
+        return bind_method(*method, (InstanceObject *) instance_object);
     }
 
     runtime_error(name.line, "Undefined property '%.*s'.", (int) name.length, name.start);
@@ -3500,6 +3534,17 @@ int find_class_method(const ClassObject *class_object, const char *name, size_t 
     }
 
     return -1;
+}
+
+const Value *find_inherited_class_method(const ClassObject *class_object, const char *name, size_t length) {
+    for (const ClassObject *current = class_object; current != NULL; current = current->superclass) {
+        int index = find_class_method(current, name, length);
+        if (index >= 0) {
+            return &current->methods[index].value;
+        }
+    }
+
+    return NULL;
 }
 
 void set_class_method(ClassObject *class_object, Token name, Value value) {
@@ -3735,9 +3780,33 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
             free_value(&value);
             return 0;
         case STMT_CLASS:
-            value = make_class_value(new_class_object(
-                stmt->as.class_statement.name.start,
-                stmt->as.class_statement.name.length));
+            {
+                ClassObject *superclass = NULL;
+                Value superclass_value = make_nil_value();
+                if (stmt->as.class_statement.superclass != NULL) {
+                    superclass_value = evaluate_expr(stmt->as.class_statement.superclass, environment, &had_runtime_error);
+                    if (had_runtime_error) {
+                        free_value(&superclass_value);
+                        return 70;
+                    }
+
+                    if (superclass_value.type != VALUE_CLASS) {
+                        runtime_error(
+                            stmt->as.class_statement.superclass->as.variable.name.line,
+                            "Superclass must be a class.");
+                        free_value(&superclass_value);
+                        return 70;
+                    }
+
+                    superclass = superclass_value.as.class_object;
+                }
+
+                value = make_class_value(new_class_object(
+                    stmt->as.class_statement.name.start,
+                    stmt->as.class_statement.name.length,
+                    superclass));
+                free_value(&superclass_value);
+            }
             for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
                 const Stmt *method = stmt->as.class_statement.methods.items[i];
                 Value method_value = make_function_value(method, environment, is_initializer_name(method->as.function.name));
