@@ -101,6 +101,7 @@ typedef enum {
     STMT_PRINT,
     STMT_VAR,
     STMT_FUNCTION,
+    STMT_RETURN,
     STMT_BLOCK,
     STMT_IF,
     STMT_WHILE
@@ -182,6 +183,10 @@ struct Stmt {
             TokenArray parameters;
             StmtArray body;
         } function;
+        struct {
+            Token keyword;
+            Expr *value;
+        } return_statement;
         struct {
             StmtArray statements;
         } block;
@@ -300,6 +305,7 @@ Stmt *parse_block_statement(Parser *parser);
 Stmt *parse_if_statement(Parser *parser);
 Stmt *parse_for_statement(Parser *parser);
 Stmt *parse_while_statement(Parser *parser);
+Stmt *parse_return_statement(Parser *parser);
 Stmt *parse_print_statement(Parser *parser);
 Stmt *parse_expression_statement(Parser *parser);
 Expr *new_binary_expr(Expr *left, Token operator_token, Expr *right);
@@ -317,6 +323,7 @@ Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
 Stmt *new_function_stmt(Token name, TokenArray parameters, StmtArray body);
+Stmt *new_return_stmt(Token keyword, Expr *value);
 Stmt *new_block_stmt(StmtArray statements);
 Stmt *new_if_stmt(Expr *condition, Stmt *then_branch, Stmt *else_branch);
 Stmt *new_while_stmt(Expr *condition, Stmt *body);
@@ -355,8 +362,8 @@ int assign_variable(Environment *environment, Token name, Value value, int *had_
 int is_truthy(Value value);
 int values_equal(Value left, Value right);
 void print_value(Value value);
-int interpret_statement(const Stmt *stmt, Environment *environment);
-int interpret_statements(const StmtArray *statements, Environment *environment);
+int interpret_statement(const Stmt *stmt, Environment *environment, int *did_return, Value *return_value);
+int interpret_statements(const StmtArray *statements, Environment *environment, int *did_return, Value *return_value);
 int run_tokenize_command(const char *filename);
 int run_parse_command(const char *filename);
 int run_evaluate_command(const char *filename);
@@ -1329,6 +1336,10 @@ Stmt *parse_statement(Parser *parser) {
         return parse_while_statement(parser);
     }
 
+    if (parser_match(parser, &(TokenType){TOKEN_RETURN}, 1)) {
+        return parse_return_statement(parser);
+    }
+
     if (parser_match(parser, &(TokenType){TOKEN_PRINT}, 1)) {
         return parse_print_statement(parser);
     }
@@ -1547,6 +1558,26 @@ Stmt *parse_while_statement(Parser *parser) {
     return new_while_stmt(condition, body);
 }
 
+Stmt *parse_return_statement(Parser *parser) {
+    Token keyword = parser_previous(parser);
+    Expr *value = NULL;
+
+    if (!parser_check(parser, TOKEN_SEMICOLON)) {
+        value = parse_expression(parser);
+        if (value == NULL) {
+            return NULL;
+        }
+    }
+
+    parser_consume(parser, TOKEN_SEMICOLON, "Expect ';' after return value.");
+    if (parser->had_error) {
+        free_expr(value);
+        return NULL;
+    }
+
+    return new_return_stmt(keyword, value);
+}
+
 Stmt *parse_print_statement(Parser *parser) {
     Expr *expression = parse_expression(parser);
     if (expression == NULL) {
@@ -1709,6 +1740,14 @@ Stmt *new_function_stmt(Token name, TokenArray parameters, StmtArray body) {
     return stmt;
 }
 
+Stmt *new_return_stmt(Token keyword, Expr *value) {
+    Stmt *stmt = xmalloc(sizeof(Stmt));
+    stmt->type = STMT_RETURN;
+    stmt->as.return_statement.keyword = keyword;
+    stmt->as.return_statement.value = value;
+    return stmt;
+}
+
 Stmt *new_block_stmt(StmtArray statements) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_BLOCK;
@@ -1786,6 +1825,9 @@ void free_stmt(Stmt *stmt) {
         case STMT_FUNCTION:
             free_token_array(&stmt->as.function.parameters);
             free_stmt_array(&stmt->as.function.body);
+            break;
+        case STMT_RETURN:
+            free_expr(stmt->as.return_statement.value);
             break;
         case STMT_BLOCK:
             free_stmt_array(&stmt->as.block.statements);
@@ -2366,7 +2408,13 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     define_variable(&function_environment, declaration->as.function.parameters.items[i], arguments[i]);
                 }
 
-                int exit_code = interpret_statements(&declaration->as.function.body, &function_environment);
+                int did_return = 0;
+                Value return_value = make_nil_value();
+                int exit_code = interpret_statements(
+                    &declaration->as.function.body,
+                    &function_environment,
+                    &did_return,
+                    &return_value);
                 free_environment(&function_environment);
                 if (exit_code != 0) {
                     *had_runtime_error = 1;
@@ -2378,7 +2426,12 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     return make_nil_value();
                 }
 
-                result = make_nil_value();
+                if (did_return) {
+                    result = return_value;
+                } else {
+                    result = make_nil_value();
+                    free_value(&return_value);
+                }
             }
             for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
                 free_value(&arguments[i]);
@@ -2649,7 +2702,7 @@ void print_value(Value value) {
     }
 }
 
-int interpret_statement(const Stmt *stmt, Environment *environment) {
+int interpret_statement(const Stmt *stmt, Environment *environment, int *did_return, Value *return_value) {
     int had_runtime_error = 0;
     Value value;
 
@@ -2686,10 +2739,25 @@ int interpret_statement(const Stmt *stmt, Environment *environment) {
             define_variable(environment, stmt->as.function.name, value);
             free_value(&value);
             return 0;
+        case STMT_RETURN:
+            if (stmt->as.return_statement.value == NULL) {
+                value = make_nil_value();
+            } else {
+                value = evaluate_expr(stmt->as.return_statement.value, environment, &had_runtime_error);
+                if (had_runtime_error) {
+                    free_value(&value);
+                    return 70;
+                }
+            }
+
+            free_value(return_value);
+            *return_value = value;
+            *did_return = 1;
+            return 0;
         case STMT_BLOCK: {
             Environment block_environment;
             init_enclosed_environment(&block_environment, environment);
-            int exit_code = interpret_statements(&stmt->as.block.statements, &block_environment);
+            int exit_code = interpret_statements(&stmt->as.block.statements, &block_environment, did_return, return_value);
             free_environment(&block_environment);
             return exit_code;
         }
@@ -2702,12 +2770,12 @@ int interpret_statement(const Stmt *stmt, Environment *environment) {
 
             if (is_truthy(value)) {
                 free_value(&value);
-                return interpret_statement(stmt->as.if_statement.then_branch, environment);
+                return interpret_statement(stmt->as.if_statement.then_branch, environment, did_return, return_value);
             }
 
             free_value(&value);
             if (stmt->as.if_statement.else_branch != NULL) {
-                return interpret_statement(stmt->as.if_statement.else_branch, environment);
+                return interpret_statement(stmt->as.if_statement.else_branch, environment, did_return, return_value);
             }
             return 0;
         case STMT_WHILE:
@@ -2724,9 +2792,13 @@ int interpret_statement(const Stmt *stmt, Environment *environment) {
                     return 0;
                 }
 
-                int exit_code = interpret_statement(stmt->as.while_statement.body, environment);
+                int exit_code = interpret_statement(stmt->as.while_statement.body, environment, did_return, return_value);
                 if (exit_code != 0) {
                     return exit_code;
+                }
+
+                if (*did_return) {
+                    return 0;
                 }
             }
     }
@@ -2734,11 +2806,15 @@ int interpret_statement(const Stmt *stmt, Environment *environment) {
     return 70;
 }
 
-int interpret_statements(const StmtArray *statements, Environment *environment) {
+int interpret_statements(const StmtArray *statements, Environment *environment, int *did_return, Value *return_value) {
     for (size_t i = 0; i < statements->count; i++) {
-        int exit_code = interpret_statement(statements->items[i], environment);
+        int exit_code = interpret_statement(statements->items[i], environment, did_return, return_value);
         if (exit_code != 0) {
             return exit_code;
+        }
+
+        if (*did_return) {
+            return 0;
         }
     }
 
@@ -2758,7 +2834,10 @@ int run_run_command(const char *filename) {
         return exit_code;
     }
 
-    exit_code = interpret_statements(&statements, &environment);
+    int did_return = 0;
+    Value return_value = make_nil_value();
+    exit_code = interpret_statements(&statements, &environment, &did_return, &return_value);
+    free_value(&return_value);
 
     free_stmt_array(&statements);
     free_token_array(&tokens);
