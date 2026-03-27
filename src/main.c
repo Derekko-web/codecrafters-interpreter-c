@@ -95,7 +95,8 @@ typedef enum {
     STMT_EXPRESSION,
     STMT_PRINT,
     STMT_VAR,
-    STMT_BLOCK
+    STMT_BLOCK,
+    STMT_IF
 } StmtType;
 
 typedef struct Expr Expr;
@@ -154,6 +155,11 @@ struct Stmt {
         struct {
             StmtArray statements;
         } block;
+        struct {
+            Expr *condition;
+            Stmt *then_branch;
+            Stmt *else_branch;
+        } if_statement;
     } as;
 };
 
@@ -237,6 +243,7 @@ Stmt *parse_declaration(Parser *parser);
 Stmt *parse_statement(Parser *parser);
 Stmt *parse_var_declaration(Parser *parser);
 Stmt *parse_block_statement(Parser *parser);
+Stmt *parse_if_statement(Parser *parser);
 Stmt *parse_print_statement(Parser *parser);
 Stmt *parse_expression_statement(Parser *parser);
 Expr *new_binary_expr(Expr *left, Token operator_token, Expr *right);
@@ -252,6 +259,7 @@ Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
 Stmt *new_block_stmt(StmtArray statements);
+Stmt *new_if_stmt(Expr *condition, Stmt *then_branch, Stmt *else_branch);
 void free_expr(Expr *expr);
 void free_stmt(Stmt *stmt);
 int parser_is_at_end(const Parser *parser);
@@ -1061,6 +1069,10 @@ Stmt *parse_statement(Parser *parser) {
         return parse_block_statement(parser);
     }
 
+    if (parser_match(parser, &(TokenType){TOKEN_IF}, 1)) {
+        return parse_if_statement(parser);
+    }
+
     if (parser_match(parser, &(TokenType){TOKEN_PRINT}, 1)) {
         return parse_print_statement(parser);
     }
@@ -1115,6 +1127,42 @@ Stmt *parse_block_statement(Parser *parser) {
     }
 
     return new_block_stmt(statements);
+}
+
+Stmt *parse_if_statement(Parser *parser) {
+    parser_consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after 'if'.");
+    if (parser->had_error) {
+        return NULL;
+    }
+
+    Expr *condition = parse_expression(parser);
+    if (condition == NULL) {
+        return NULL;
+    }
+
+    parser_consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after if condition.");
+    if (parser->had_error) {
+        free_expr(condition);
+        return NULL;
+    }
+
+    Stmt *then_branch = parse_statement(parser);
+    if (then_branch == NULL) {
+        free_expr(condition);
+        return NULL;
+    }
+
+    Stmt *else_branch = NULL;
+    if (parser_match(parser, &(TokenType){TOKEN_ELSE}, 1)) {
+        else_branch = parse_statement(parser);
+        if (else_branch == NULL) {
+            free_expr(condition);
+            free_stmt(then_branch);
+            return NULL;
+        }
+    }
+
+    return new_if_stmt(condition, then_branch, else_branch);
 }
 
 Stmt *parse_print_statement(Parser *parser) {
@@ -1259,6 +1307,15 @@ Stmt *new_block_stmt(StmtArray statements) {
     return stmt;
 }
 
+Stmt *new_if_stmt(Expr *condition, Stmt *then_branch, Stmt *else_branch) {
+    Stmt *stmt = xmalloc(sizeof(Stmt));
+    stmt->type = STMT_IF;
+    stmt->as.if_statement.condition = condition;
+    stmt->as.if_statement.then_branch = then_branch;
+    stmt->as.if_statement.else_branch = else_branch;
+    return stmt;
+}
+
 void free_expr(Expr *expr) {
     if (expr == NULL) {
         return;
@@ -1303,6 +1360,11 @@ void free_stmt(Stmt *stmt) {
             break;
         case STMT_BLOCK:
             free_stmt_array(&stmt->as.block.statements);
+            break;
+        case STMT_IF:
+            free_expr(stmt->as.if_statement.condition);
+            free_stmt(stmt->as.if_statement.then_branch);
+            free_stmt(stmt->as.if_statement.else_branch);
             break;
     }
 
@@ -2005,6 +2067,23 @@ int interpret_statement(const Stmt *stmt, Environment *environment) {
             free_environment(&block_environment);
             return exit_code;
         }
+        case STMT_IF:
+            value = evaluate_expr(stmt->as.if_statement.condition, environment, &had_runtime_error);
+            if (had_runtime_error) {
+                free_value(&value);
+                return 70;
+            }
+
+            if (is_truthy(value)) {
+                free_value(&value);
+                return interpret_statement(stmt->as.if_statement.then_branch, environment);
+            }
+
+            free_value(&value);
+            if (stmt->as.if_statement.else_branch != NULL) {
+                return interpret_statement(stmt->as.if_statement.else_branch, environment);
+            }
+            return 0;
     }
 
     return 70;
