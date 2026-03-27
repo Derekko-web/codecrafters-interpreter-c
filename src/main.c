@@ -92,6 +92,7 @@ typedef enum {
     VALUE_BOOL,
     VALUE_NUMBER,
     VALUE_STRING,
+    VALUE_CLASS,
     VALUE_NATIVE_FUNCTION,
     VALUE_FUNCTION
 } ValueType;
@@ -100,6 +101,7 @@ typedef enum {
     STMT_EXPRESSION,
     STMT_PRINT,
     STMT_VAR,
+    STMT_CLASS,
     STMT_FUNCTION,
     STMT_RETURN,
     STMT_BLOCK,
@@ -120,6 +122,7 @@ typedef struct StmtArray {
     size_t capacity;
 } StmtArray;
 typedef struct NativeFunction NativeFunction;
+typedef struct ClassObject ClassObject;
 typedef struct Value Value;
 typedef struct Environment Environment;
 
@@ -184,6 +187,9 @@ struct Stmt {
         } var;
         struct {
             Token name;
+        } class_statement;
+        struct {
+            Token name;
             TokenArray parameters;
             StmtArray body;
         } function;
@@ -216,6 +222,7 @@ struct Value {
             size_t length;
             int owns_memory;
         } string;
+        ClassObject *class_object;
         const NativeFunction *native_function;
         struct {
             const Stmt *declaration;
@@ -228,6 +235,11 @@ struct NativeFunction {
     const char *name;
     int arity;
     Value (*function)(int argument_count, const Value *arguments);
+};
+
+struct ClassObject {
+    char *name;
+    size_t ref_count;
 };
 
 typedef struct {
@@ -330,6 +342,7 @@ Expr *parse_call(Parser *parser);
 Expr *parse_finish_call(Parser *parser, Expr *callee);
 Expr *parse_primary(Parser *parser);
 Stmt *parse_declaration(Parser *parser);
+Stmt *parse_class_declaration(Parser *parser);
 Stmt *parse_function_declaration(Parser *parser);
 Stmt *parse_statement(Parser *parser);
 Stmt *parse_var_declaration(Parser *parser);
@@ -355,6 +368,7 @@ Expr *new_call_expr(Expr *callee, Token paren, ExprArray arguments);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
+Stmt *new_class_stmt(Token name);
 Stmt *new_function_stmt(Token name, TokenArray parameters, StmtArray body);
 Stmt *new_return_stmt(Token keyword, Expr *value);
 Stmt *new_block_stmt(StmtArray statements);
@@ -396,6 +410,10 @@ Value make_nil_value(void);
 Value make_boolean_value(int boolean);
 Value make_number_value(double number);
 Value make_string_value(const char *start, size_t length);
+ClassObject *new_class_object(const char *name, size_t length);
+ClassObject *retain_class_object(ClassObject *class_object);
+void release_class_object(ClassObject *class_object);
+Value make_class_value(ClassObject *class_object);
 Value make_native_function_value(const NativeFunction *native_function);
 Value make_function_value(const Stmt *declaration, Environment *closure);
 char *copy_string_slice(const char *start, size_t length);
@@ -1351,6 +1369,10 @@ Expr *parse_primary(Parser *parser) {
 }
 
 Stmt *parse_declaration(Parser *parser) {
+    if (parser_match(parser, &(TokenType){TOKEN_CLASS}, 1)) {
+        return parse_class_declaration(parser);
+    }
+
     if (parser_match(parser, &(TokenType){TOKEN_FUN}, 1)) {
         return parse_function_declaration(parser);
     }
@@ -1360,6 +1382,25 @@ Stmt *parse_declaration(Parser *parser) {
     }
 
     return parse_statement(parser);
+}
+
+Stmt *parse_class_declaration(Parser *parser) {
+    Token name = parser_consume(parser, TOKEN_IDENTIFIER, "Expect class name.");
+    if (parser->had_error) {
+        return NULL;
+    }
+
+    parser_consume(parser, TOKEN_LEFT_BRACE, "Expect '{' before class body.");
+    if (parser->had_error) {
+        return NULL;
+    }
+
+    parser_consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after class body.");
+    if (parser->had_error) {
+        return NULL;
+    }
+
+    return new_class_stmt(name);
 }
 
 Stmt *parse_function_declaration(Parser *parser) {
@@ -1827,6 +1868,13 @@ Stmt *new_var_stmt(Token name, Expr *initializer) {
     return stmt;
 }
 
+Stmt *new_class_stmt(Token name) {
+    Stmt *stmt = xmalloc(sizeof(Stmt));
+    stmt->type = STMT_CLASS;
+    stmt->as.class_statement.name = name;
+    return stmt;
+}
+
 Stmt *new_function_stmt(Token name, TokenArray parameters, StmtArray body) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_FUNCTION;
@@ -1917,6 +1965,8 @@ void free_stmt(Stmt *stmt) {
             break;
         case STMT_VAR:
             free_expr(stmt->as.var.initializer);
+            break;
+        case STMT_CLASS:
             break;
         case STMT_FUNCTION:
             free_token_array(&stmt->as.function.parameters);
@@ -2403,6 +2453,10 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
             resolver_resolve_expr(resolver, stmt->as.var.initializer);
             resolver_define(resolver, stmt->as.var.name);
             return;
+        case STMT_CLASS:
+            resolver_declare(resolver, stmt->as.class_statement.name);
+            resolver_define(resolver, stmt->as.class_statement.name);
+            return;
         case STMT_FUNCTION:
             resolver_declare(resolver, stmt->as.function.name);
             resolver_define(resolver, stmt->as.function.name);
@@ -2852,6 +2906,43 @@ Value make_string_value(const char *start, size_t length) {
     return value;
 }
 
+ClassObject *new_class_object(const char *name, size_t length) {
+    ClassObject *class_object = xmalloc(sizeof(ClassObject));
+    class_object->name = copy_string_slice(name, length);
+    class_object->ref_count = 1;
+    return class_object;
+}
+
+ClassObject *retain_class_object(ClassObject *class_object) {
+    if (class_object != NULL) {
+        class_object->ref_count++;
+    }
+
+    return class_object;
+}
+
+void release_class_object(ClassObject *class_object) {
+    if (class_object == NULL) {
+        return;
+    }
+
+    if (class_object->ref_count > 1) {
+        class_object->ref_count--;
+        return;
+    }
+
+    free(class_object->name);
+    free(class_object);
+}
+
+Value make_class_value(ClassObject *class_object) {
+    Value value = {
+        .type = VALUE_CLASS,
+        .as.class_object = class_object,
+    };
+    return value;
+}
+
 Value make_native_function_value(const NativeFunction *native_function) {
     Value value = {
         .type = VALUE_NATIVE_FUNCTION,
@@ -2894,6 +2985,8 @@ Value clone_value(Value value) {
             };
             return copy;
         }
+        case VALUE_CLASS:
+            return make_class_value(retain_class_object(value.as.class_object));
         case VALUE_NATIVE_FUNCTION:
             return make_native_function_value(value.as.native_function);
         case VALUE_FUNCTION:
@@ -2922,6 +3015,10 @@ Value concatenate_strings(Value left, Value right) {
 void free_value(Value *value) {
     if (value->type == VALUE_STRING && value->as.string.owns_memory) {
         free((void *) value->as.string.start);
+    }
+
+    if (value->type == VALUE_CLASS) {
+        release_class_object(value->as.class_object);
     }
 
     if (value->type == VALUE_FUNCTION) {
@@ -3048,6 +3145,7 @@ int is_truthy(Value value) {
             return value.as.boolean;
         case VALUE_NUMBER:
         case VALUE_STRING:
+        case VALUE_CLASS:
         case VALUE_NATIVE_FUNCTION:
         case VALUE_FUNCTION:
             return 1;
@@ -3071,6 +3169,8 @@ int values_equal(Value left, Value right) {
         case VALUE_STRING:
             return left.as.string.length == right.as.string.length &&
                    strncmp(left.as.string.start, right.as.string.start, left.as.string.length) == 0;
+        case VALUE_CLASS:
+            return left.as.class_object == right.as.class_object;
         case VALUE_NATIVE_FUNCTION:
             return left.as.native_function == right.as.native_function;
         case VALUE_FUNCTION:
@@ -3097,6 +3197,9 @@ void print_value(Value value) {
         }
         case VALUE_STRING:
             printf("%.*s", (int) value.as.string.length, value.as.string.start);
+            return;
+        case VALUE_CLASS:
+            printf("%s", value.as.class_object->name);
             return;
         case VALUE_NATIVE_FUNCTION:
             printf("<native fn>");
@@ -3140,6 +3243,13 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
                 }
             }
             define_variable(environment, stmt->as.var.name, value);
+            free_value(&value);
+            return 0;
+        case STMT_CLASS:
+            value = make_class_value(new_class_object(
+                stmt->as.class_statement.name.start,
+                stmt->as.class_statement.name.length));
+            define_variable(environment, stmt->as.class_statement.name, value);
             free_value(&value);
             return 0;
         case STMT_FUNCTION:
