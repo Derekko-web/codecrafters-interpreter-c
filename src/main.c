@@ -257,6 +257,7 @@ Stmt *parse_statement(Parser *parser);
 Stmt *parse_var_declaration(Parser *parser);
 Stmt *parse_block_statement(Parser *parser);
 Stmt *parse_if_statement(Parser *parser);
+Stmt *parse_for_statement(Parser *parser);
 Stmt *parse_while_statement(Parser *parser);
 Stmt *parse_print_statement(Parser *parser);
 Stmt *parse_expression_statement(Parser *parser);
@@ -1125,6 +1126,10 @@ Stmt *parse_statement(Parser *parser) {
         return parse_block_statement(parser);
     }
 
+    if (parser_match(parser, &(TokenType){TOKEN_FOR}, 1)) {
+        return parse_for_statement(parser);
+    }
+
     if (parser_match(parser, &(TokenType){TOKEN_IF}, 1)) {
         return parse_if_statement(parser);
     }
@@ -1138,6 +1143,99 @@ Stmt *parse_statement(Parser *parser) {
     }
 
     return parse_expression_statement(parser);
+}
+
+Stmt *parse_for_statement(Parser *parser) {
+    parser_consume(parser, TOKEN_LEFT_PAREN, "Expect '(' after 'for'.");
+    if (parser->had_error) {
+        return NULL;
+    }
+
+    Stmt *initializer = NULL;
+    if (parser_match(parser, &(TokenType){TOKEN_SEMICOLON}, 1)) {
+        initializer = NULL;
+    } else if (parser_match(parser, &(TokenType){TOKEN_VAR}, 1)) {
+        initializer = parse_var_declaration(parser);
+    } else {
+        initializer = parse_expression_statement(parser);
+    }
+
+    if (parser->had_error) {
+        free_stmt(initializer);
+        return NULL;
+    }
+
+    Expr *condition = NULL;
+    if (!parser_check(parser, TOKEN_SEMICOLON)) {
+        condition = parse_expression(parser);
+        if (condition == NULL) {
+            free_stmt(initializer);
+            return NULL;
+        }
+    }
+
+    parser_consume(parser, TOKEN_SEMICOLON, "Expect ';' after loop condition.");
+    if (parser->had_error) {
+        free_stmt(initializer);
+        free_expr(condition);
+        return NULL;
+    }
+
+    Expr *increment = NULL;
+    if (!parser_check(parser, TOKEN_RIGHT_PAREN)) {
+        increment = parse_expression(parser);
+        if (increment == NULL) {
+            free_stmt(initializer);
+            free_expr(condition);
+            return NULL;
+        }
+    }
+
+    parser_consume(parser, TOKEN_RIGHT_PAREN, "Expect ')' after for clauses.");
+    if (parser->had_error) {
+        free_stmt(initializer);
+        free_expr(condition);
+        free_expr(increment);
+        return NULL;
+    }
+
+    Stmt *body = parse_statement(parser);
+    if (body == NULL) {
+        free_stmt(initializer);
+        free_expr(condition);
+        free_expr(increment);
+        return NULL;
+    }
+
+    if (increment != NULL) {
+        StmtArray statements = {
+            .items = NULL,
+            .count = 0,
+            .capacity = 0,
+        };
+        append_stmt(&statements, body);
+        append_stmt(&statements, new_expression_stmt(increment));
+        body = new_block_stmt(statements);
+    }
+
+    if (condition == NULL) {
+        condition = new_boolean_literal_expr(1);
+    }
+
+    body = new_while_stmt(condition, body);
+
+    if (initializer != NULL) {
+        StmtArray statements = {
+            .items = NULL,
+            .count = 0,
+            .capacity = 0,
+        };
+        append_stmt(&statements, initializer);
+        append_stmt(&statements, body);
+        body = new_block_stmt(statements);
+    }
+
+    return body;
 }
 
 Stmt *parse_var_declaration(Parser *parser) {
