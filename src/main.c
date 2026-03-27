@@ -72,7 +72,8 @@ typedef enum {
     EXPR_GROUPING,
     EXPR_LITERAL,
     EXPR_UNARY,
-    EXPR_VARIABLE
+    EXPR_VARIABLE,
+    EXPR_ASSIGN
 } ExprType;
 
 typedef enum {
@@ -123,6 +124,10 @@ struct Expr {
         struct {
             Token name;
         } variable;
+        struct {
+            Token name;
+            Expr *value;
+        } assign;
     } as;
 };
 
@@ -215,6 +220,7 @@ int is_digit(char c);
 int is_alpha(char c);
 int is_alphanumeric(char c);
 Expr *parse_expression(Parser *parser);
+Expr *parse_assignment(Parser *parser);
 Expr *parse_equality(Parser *parser);
 Expr *parse_comparison(Parser *parser);
 Expr *parse_term(Parser *parser);
@@ -234,6 +240,7 @@ Expr *new_number_literal_expr(double number);
 Expr *new_string_literal_expr(const char *start, size_t length);
 Expr *new_unary_expr(Token operator_token, Expr *right);
 Expr *new_variable_expr(Token name);
+Expr *new_assign_expr(Token name, Expr *value);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
@@ -252,7 +259,7 @@ void print_parenthesized(const char *name, size_t name_length, const Expr *const
 int scan_file_to_tokens(const char *filename, char **source_out, TokenArray *tokens_out);
 int parse_file_to_expression(const char *filename, char **source_out, TokenArray *tokens_out, Expr **expression_out);
 int parse_file_to_statements(const char *filename, char **source_out, TokenArray *tokens_out, StmtArray *statements_out);
-Value evaluate_expr(const Expr *expr, const Environment *environment, int *had_runtime_error);
+Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime_error);
 Value make_nil_value(void);
 Value make_boolean_value(int boolean);
 Value make_number_value(double number);
@@ -264,6 +271,7 @@ void free_value(Value *value);
 int find_environment_entry(const Environment *environment, const char *name, size_t length);
 void define_variable(Environment *environment, Token name, Value value);
 Value get_variable(const Environment *environment, Token name, int *had_runtime_error);
+int assign_variable(Environment *environment, Token name, Value value, int *had_runtime_error);
 int is_truthy(Value value);
 int values_equal(Value left, Value right);
 void print_value(Value value);
@@ -842,7 +850,36 @@ int is_alphanumeric(char c) {
 }
 
 Expr *parse_expression(Parser *parser) {
-    return parse_equality(parser);
+    return parse_assignment(parser);
+}
+
+Expr *parse_assignment(Parser *parser) {
+    Expr *expression = parse_equality(parser);
+    if (expression == NULL) {
+        return NULL;
+    }
+
+    if (parser_match(parser, &(TokenType){TOKEN_EQUAL}, 1)) {
+        Token equals = parser_previous(parser);
+        Expr *value = parse_assignment(parser);
+        if (value == NULL) {
+            free_expr(expression);
+            return NULL;
+        }
+
+        if (expression->type == EXPR_VARIABLE) {
+            Token name = expression->as.variable.name;
+            free_expr(expression);
+            return new_assign_expr(name, value);
+        }
+
+        parser_error(parser, equals, "Invalid assignment target.");
+        free_expr(expression);
+        free_expr(value);
+        return NULL;
+    }
+
+    return expression;
 }
 
 Expr *parse_equality(Parser *parser) {
@@ -1139,6 +1176,14 @@ Expr *new_variable_expr(Token name) {
     return expr;
 }
 
+Expr *new_assign_expr(Token name, Expr *value) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_ASSIGN;
+    expr->as.assign.name = name;
+    expr->as.assign.value = value;
+    return expr;
+}
+
 Stmt *new_expression_stmt(Expr *expression) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_EXPRESSION;
@@ -1176,6 +1221,9 @@ void free_expr(Expr *expr) {
             break;
         case EXPR_UNARY:
             free_expr(expr->as.unary.right);
+            break;
+        case EXPR_ASSIGN:
+            free_expr(expr->as.assign.value);
             break;
         case EXPR_VARIABLE:
         case EXPR_LITERAL:
@@ -1313,6 +1361,12 @@ void print_expr(const Expr *expr) {
         case EXPR_VARIABLE:
             printf("%.*s", (int) expr->as.variable.name.length, expr->as.variable.name.start);
             return;
+        case EXPR_ASSIGN: {
+            printf("(= %.*s ", (int) expr->as.assign.name.length, expr->as.assign.name.start);
+            print_expr(expr->as.assign.value);
+            printf(")");
+            return;
+        }
     }
 }
 
@@ -1419,7 +1473,7 @@ int parse_file_to_statements(const char *filename, char **source_out, TokenArray
     return 0;
 }
 
-Value evaluate_expr(const Expr *expr, const Environment *environment, int *had_runtime_error) {
+Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime_error) {
     switch (expr->type) {
         case EXPR_LITERAL:
             switch (expr->as.literal.type) {
@@ -1623,6 +1677,20 @@ Value evaluate_expr(const Expr *expr, const Environment *environment, int *had_r
         }
         case EXPR_VARIABLE:
             return get_variable(environment, expr->as.variable.name, had_runtime_error);
+        case EXPR_ASSIGN: {
+            Value value = evaluate_expr(expr->as.assign.value, environment, had_runtime_error);
+            if (*had_runtime_error) {
+                free_value(&value);
+                return make_nil_value();
+            }
+
+            if (!assign_variable(environment, expr->as.assign.name, value, had_runtime_error)) {
+                free_value(&value);
+                return make_nil_value();
+            }
+
+            return value;
+        }
     }
 
     fprintf(stderr, "Runtime error: Unsupported expression.\n");
@@ -1761,6 +1829,19 @@ Value get_variable(const Environment *environment, Token name, int *had_runtime_
     }
 
     return clone_value(environment->items[index].value);
+}
+
+int assign_variable(Environment *environment, Token name, Value value, int *had_runtime_error) {
+    int index = find_environment_entry(environment, name.start, name.length);
+    if (index < 0) {
+        fprintf(stderr, "[line %d] Runtime error: Undefined variable '%.*s'.\n", name.line, (int) name.length, name.start);
+        *had_runtime_error = 1;
+        return 0;
+    }
+
+    free_value(&environment->items[index].value);
+    environment->items[index].value = clone_value(value);
+    return 1;
 }
 
 int is_truthy(Value value) {
