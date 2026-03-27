@@ -71,7 +71,8 @@ typedef enum {
     EXPR_BINARY,
     EXPR_GROUPING,
     EXPR_LITERAL,
-    EXPR_UNARY
+    EXPR_UNARY,
+    EXPR_VARIABLE
 } ExprType;
 
 typedef enum {
@@ -90,7 +91,8 @@ typedef enum {
 
 typedef enum {
     STMT_EXPRESSION,
-    STMT_PRINT
+    STMT_PRINT,
+    STMT_VAR
 } StmtType;
 
 typedef struct Expr Expr;
@@ -118,6 +120,9 @@ struct Expr {
             Token operator_token;
             Expr *right;
         } unary;
+        struct {
+            Token name;
+        } variable;
     } as;
 };
 
@@ -130,6 +135,10 @@ struct Stmt {
         struct {
             Expr *expression;
         } print;
+        struct {
+            Token name;
+            Expr *initializer;
+        } var;
     } as;
 };
 
@@ -147,10 +156,22 @@ typedef struct {
 } Value;
 
 typedef struct {
+    char *name;
+    size_t length;
+    Value value;
+} EnvironmentEntry;
+
+typedef struct {
     Stmt **items;
     size_t count;
     size_t capacity;
 } StmtArray;
+
+typedef struct {
+    EnvironmentEntry *items;
+    size_t count;
+    size_t capacity;
+} Environment;
 
 typedef struct {
     TokenArray *tokens;
@@ -165,6 +186,8 @@ void free_token_array(TokenArray *tokens);
 void append_token(TokenArray *tokens, Token token);
 void free_stmt_array(StmtArray *statements);
 void append_stmt(StmtArray *statements, Stmt *stmt);
+void init_environment(Environment *environment);
+void free_environment(Environment *environment);
 void init_scanner(Scanner *scanner, const char *source);
 int scan_tokens(Scanner *scanner);
 void scan_token(Scanner *scanner);
@@ -198,7 +221,9 @@ Expr *parse_term(Parser *parser);
 Expr *parse_factor(Parser *parser);
 Expr *parse_unary(Parser *parser);
 Expr *parse_primary(Parser *parser);
+Stmt *parse_declaration(Parser *parser);
 Stmt *parse_statement(Parser *parser);
+Stmt *parse_var_declaration(Parser *parser);
 Stmt *parse_print_statement(Parser *parser);
 Stmt *parse_expression_statement(Parser *parser);
 Expr *new_binary_expr(Expr *left, Token operator_token, Expr *right);
@@ -208,8 +233,10 @@ Expr *new_boolean_literal_expr(int boolean);
 Expr *new_number_literal_expr(double number);
 Expr *new_string_literal_expr(const char *start, size_t length);
 Expr *new_unary_expr(Token operator_token, Expr *right);
+Expr *new_variable_expr(Token name);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
+Stmt *new_var_stmt(Token name, Expr *initializer);
 void free_expr(Expr *expr);
 void free_stmt(Stmt *stmt);
 int parser_is_at_end(const Parser *parser);
@@ -225,18 +252,23 @@ void print_parenthesized(const char *name, size_t name_length, const Expr *const
 int scan_file_to_tokens(const char *filename, char **source_out, TokenArray *tokens_out);
 int parse_file_to_expression(const char *filename, char **source_out, TokenArray *tokens_out, Expr **expression_out);
 int parse_file_to_statements(const char *filename, char **source_out, TokenArray *tokens_out, StmtArray *statements_out);
-Value evaluate_expr(const Expr *expr, int *had_runtime_error);
+Value evaluate_expr(const Expr *expr, const Environment *environment, int *had_runtime_error);
 Value make_nil_value(void);
 Value make_boolean_value(int boolean);
 Value make_number_value(double number);
 Value make_string_value(const char *start, size_t length);
+char *copy_string_slice(const char *start, size_t length);
+Value clone_value(Value value);
 Value concatenate_strings(Value left, Value right);
 void free_value(Value *value);
+int find_environment_entry(const Environment *environment, const char *name, size_t length);
+void define_variable(Environment *environment, Token name, Value value);
+Value get_variable(const Environment *environment, Token name, int *had_runtime_error);
 int is_truthy(Value value);
 int values_equal(Value left, Value right);
 void print_value(Value value);
-int interpret_statement(const Stmt *stmt);
-int interpret_statements(const StmtArray *statements);
+int interpret_statement(const Stmt *stmt, Environment *environment);
+int interpret_statements(const StmtArray *statements, Environment *environment);
 int run_tokenize_command(const char *filename);
 int run_parse_command(const char *filename);
 int run_evaluate_command(const char *filename);
@@ -310,17 +342,21 @@ int run_evaluate_command(const char *filename) {
     char *source = NULL;
     TokenArray tokens = {0};
     Expr *expression = NULL;
+    Environment environment;
+    init_environment(&environment);
     int exit_code = parse_file_to_expression(filename, &source, &tokens, &expression);
     if (exit_code != 0) {
+        free_environment(&environment);
         return exit_code;
     }
 
     int had_runtime_error = 0;
-    Value value = evaluate_expr(expression, &had_runtime_error);
+    Value value = evaluate_expr(expression, &environment, &had_runtime_error);
     if (had_runtime_error) {
         free_expr(expression);
         free_token_array(&tokens);
         free(source);
+        free_environment(&environment);
         return 70;
     }
 
@@ -331,6 +367,7 @@ int run_evaluate_command(const char *filename) {
     free_expr(expression);
     free_token_array(&tokens);
     free(source);
+    free_environment(&environment);
     return 0;
 }
 
@@ -428,6 +465,24 @@ void append_stmt(StmtArray *statements, Stmt *stmt) {
     }
 
     statements->items[statements->count++] = stmt;
+}
+
+void init_environment(Environment *environment) {
+    environment->items = NULL;
+    environment->count = 0;
+    environment->capacity = 0;
+}
+
+void free_environment(Environment *environment) {
+    for (size_t i = 0; i < environment->count; i++) {
+        free(environment->items[i].name);
+        free_value(&environment->items[i].value);
+    }
+
+    free(environment->items);
+    environment->items = NULL;
+    environment->count = 0;
+    environment->capacity = 0;
 }
 
 void init_scanner(Scanner *scanner, const char *source) {
@@ -917,6 +972,10 @@ Expr *parse_primary(Parser *parser) {
         return new_string_literal_expr(string_token.start + 1, string_token.length - 2);
     }
 
+    if (parser_match(parser, &(TokenType){TOKEN_IDENTIFIER}, 1)) {
+        return new_variable_expr(parser_previous(parser));
+    }
+
     if (parser_match(parser, &(TokenType){TOKEN_LEFT_PAREN}, 1)) {
         Expr *expression = parse_expression(parser);
         if (expression == NULL) {
@@ -936,12 +995,43 @@ Expr *parse_primary(Parser *parser) {
     return NULL;
 }
 
+Stmt *parse_declaration(Parser *parser) {
+    if (parser_match(parser, &(TokenType){TOKEN_VAR}, 1)) {
+        return parse_var_declaration(parser);
+    }
+
+    return parse_statement(parser);
+}
+
 Stmt *parse_statement(Parser *parser) {
     if (parser_match(parser, &(TokenType){TOKEN_PRINT}, 1)) {
         return parse_print_statement(parser);
     }
 
     return parse_expression_statement(parser);
+}
+
+Stmt *parse_var_declaration(Parser *parser) {
+    Token name = parser_consume(parser, TOKEN_IDENTIFIER, "Expect variable name.");
+    if (parser->had_error) {
+        return NULL;
+    }
+
+    Expr *initializer = NULL;
+    if (parser_match(parser, &(TokenType){TOKEN_EQUAL}, 1)) {
+        initializer = parse_expression(parser);
+        if (initializer == NULL) {
+            return NULL;
+        }
+    }
+
+    parser_consume(parser, TOKEN_SEMICOLON, "Expect ';' after variable declaration.");
+    if (parser->had_error) {
+        free_expr(initializer);
+        return NULL;
+    }
+
+    return new_var_stmt(name, initializer);
 }
 
 Stmt *parse_print_statement(Parser *parser) {
@@ -1042,6 +1132,13 @@ Expr *new_unary_expr(Token operator_token, Expr *right) {
     return expr;
 }
 
+Expr *new_variable_expr(Token name) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_VARIABLE;
+    expr->as.variable.name = name;
+    return expr;
+}
+
 Stmt *new_expression_stmt(Expr *expression) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_EXPRESSION;
@@ -1053,6 +1150,14 @@ Stmt *new_print_stmt(Expr *expression) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_PRINT;
     stmt->as.print.expression = expression;
+    return stmt;
+}
+
+Stmt *new_var_stmt(Token name, Expr *initializer) {
+    Stmt *stmt = xmalloc(sizeof(Stmt));
+    stmt->type = STMT_VAR;
+    stmt->as.var.name = name;
+    stmt->as.var.initializer = initializer;
     return stmt;
 }
 
@@ -1072,6 +1177,7 @@ void free_expr(Expr *expr) {
         case EXPR_UNARY:
             free_expr(expr->as.unary.right);
             break;
+        case EXPR_VARIABLE:
         case EXPR_LITERAL:
             break;
     }
@@ -1090,6 +1196,9 @@ void free_stmt(Stmt *stmt) {
             break;
         case STMT_PRINT:
             free_expr(stmt->as.print.expression);
+            break;
+        case STMT_VAR:
+            free_expr(stmt->as.var.initializer);
             break;
     }
 
@@ -1201,6 +1310,9 @@ void print_expr(const Expr *expr) {
                 sizeof(expressions) / sizeof(expressions[0]));
             return;
         }
+        case EXPR_VARIABLE:
+            printf("%.*s", (int) expr->as.variable.name.length, expr->as.variable.name.start);
+            return;
     }
 }
 
@@ -1289,7 +1401,7 @@ int parse_file_to_statements(const char *filename, char **source_out, TokenArray
     };
 
     while (!parser_is_at_end(&parser)) {
-        Stmt *statement = parse_statement(&parser);
+        Stmt *statement = parse_declaration(&parser);
         if (statement == NULL) {
             break;
         }
@@ -1307,7 +1419,7 @@ int parse_file_to_statements(const char *filename, char **source_out, TokenArray
     return 0;
 }
 
-Value evaluate_expr(const Expr *expr, int *had_runtime_error) {
+Value evaluate_expr(const Expr *expr, const Environment *environment, int *had_runtime_error) {
     switch (expr->type) {
         case EXPR_LITERAL:
             switch (expr->as.literal.type) {
@@ -1322,9 +1434,9 @@ Value evaluate_expr(const Expr *expr, int *had_runtime_error) {
             }
             break;
         case EXPR_GROUPING:
-            return evaluate_expr(expr->as.grouping.expression, had_runtime_error);
+            return evaluate_expr(expr->as.grouping.expression, environment, had_runtime_error);
         case EXPR_UNARY: {
-            Value right = evaluate_expr(expr->as.unary.right, had_runtime_error);
+            Value right = evaluate_expr(expr->as.unary.right, environment, had_runtime_error);
             if (*had_runtime_error) {
                 free_value(&right);
                 return make_nil_value();
@@ -1356,13 +1468,13 @@ Value evaluate_expr(const Expr *expr, int *had_runtime_error) {
             break;
         }
         case EXPR_BINARY: {
-            Value left = evaluate_expr(expr->as.binary.left, had_runtime_error);
+            Value left = evaluate_expr(expr->as.binary.left, environment, had_runtime_error);
             if (*had_runtime_error) {
                 free_value(&left);
                 return make_nil_value();
             }
 
-            Value right = evaluate_expr(expr->as.binary.right, had_runtime_error);
+            Value right = evaluate_expr(expr->as.binary.right, environment, had_runtime_error);
             if (*had_runtime_error) {
                 free_value(&left);
                 free_value(&right);
@@ -1509,6 +1621,8 @@ Value evaluate_expr(const Expr *expr, int *had_runtime_error) {
             free_value(&right);
             break;
         }
+        case EXPR_VARIABLE:
+            return get_variable(environment, expr->as.variable.name, had_runtime_error);
     }
 
     fprintf(stderr, "Runtime error: Unsupported expression.\n");
@@ -1547,6 +1661,36 @@ Value make_string_value(const char *start, size_t length) {
     return value;
 }
 
+char *copy_string_slice(const char *start, size_t length) {
+    char *buffer = xmalloc(length + 1);
+    memcpy(buffer, start, length);
+    buffer[length] = '\0';
+    return buffer;
+}
+
+Value clone_value(Value value) {
+    switch (value.type) {
+        case VALUE_NIL:
+            return make_nil_value();
+        case VALUE_BOOL:
+            return make_boolean_value(value.as.boolean);
+        case VALUE_NUMBER:
+            return make_number_value(value.as.number);
+        case VALUE_STRING: {
+            char *buffer = copy_string_slice(value.as.string.start, value.as.string.length);
+            Value copy = {
+                .type = VALUE_STRING,
+                .as.string.start = buffer,
+                .as.string.length = value.as.string.length,
+                .as.string.owns_memory = 1,
+            };
+            return copy;
+        }
+    }
+
+    return make_nil_value();
+}
+
 Value concatenate_strings(Value left, Value right) {
     size_t length = left.as.string.length + right.as.string.length;
     char *buffer = xmalloc(length + 1);
@@ -1569,6 +1713,54 @@ void free_value(Value *value) {
     }
 
     *value = make_nil_value();
+}
+
+int find_environment_entry(const Environment *environment, const char *name, size_t length) {
+    if (environment == NULL) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < environment->count; i++) {
+        if (environment->items[i].length == length &&
+            strncmp(environment->items[i].name, name, length) == 0) {
+            return (int) i;
+        }
+    }
+
+    return -1;
+}
+
+void define_variable(Environment *environment, Token name, Value value) {
+    int existing_index = find_environment_entry(environment, name.start, name.length);
+    Value stored_value = clone_value(value);
+
+    if (existing_index >= 0) {
+        free_value(&environment->items[existing_index].value);
+        environment->items[existing_index].value = stored_value;
+        return;
+    }
+
+    if (environment->count == environment->capacity) {
+        size_t new_capacity = environment->capacity < 8 ? 8 : environment->capacity * 2;
+        environment->items = xrealloc(environment->items, new_capacity * sizeof(EnvironmentEntry));
+        environment->capacity = new_capacity;
+    }
+
+    environment->items[environment->count].name = copy_string_slice(name.start, name.length);
+    environment->items[environment->count].length = name.length;
+    environment->items[environment->count].value = stored_value;
+    environment->count++;
+}
+
+Value get_variable(const Environment *environment, Token name, int *had_runtime_error) {
+    int index = find_environment_entry(environment, name.start, name.length);
+    if (index < 0) {
+        fprintf(stderr, "[line %d] Runtime error: Undefined variable '%.*s'.\n", name.line, (int) name.length, name.start);
+        *had_runtime_error = 1;
+        return make_nil_value();
+    }
+
+    return clone_value(environment->items[index].value);
 }
 
 int is_truthy(Value value) {
@@ -1625,17 +1817,17 @@ void print_value(Value value) {
     }
 }
 
-int interpret_statement(const Stmt *stmt) {
+int interpret_statement(const Stmt *stmt, Environment *environment) {
     int had_runtime_error = 0;
     Value value;
 
     switch (stmt->type) {
         case STMT_EXPRESSION:
-            value = evaluate_expr(stmt->as.expression.expression, &had_runtime_error);
+            value = evaluate_expr(stmt->as.expression.expression, environment, &had_runtime_error);
             free_value(&value);
             return had_runtime_error ? 70 : 0;
         case STMT_PRINT:
-            value = evaluate_expr(stmt->as.print.expression, &had_runtime_error);
+            value = evaluate_expr(stmt->as.print.expression, environment, &had_runtime_error);
             if (had_runtime_error) {
                 free_value(&value);
                 return 70;
@@ -1644,14 +1836,27 @@ int interpret_statement(const Stmt *stmt) {
             printf("\n");
             free_value(&value);
             return 0;
+        case STMT_VAR:
+            if (stmt->as.var.initializer == NULL) {
+                value = make_nil_value();
+            } else {
+                value = evaluate_expr(stmt->as.var.initializer, environment, &had_runtime_error);
+                if (had_runtime_error) {
+                    free_value(&value);
+                    return 70;
+                }
+            }
+            define_variable(environment, stmt->as.var.name, value);
+            free_value(&value);
+            return 0;
     }
 
     return 70;
 }
 
-int interpret_statements(const StmtArray *statements) {
+int interpret_statements(const StmtArray *statements, Environment *environment) {
     for (size_t i = 0; i < statements->count; i++) {
-        int exit_code = interpret_statement(statements->items[i]);
+        int exit_code = interpret_statement(statements->items[i], environment);
         if (exit_code != 0) {
             return exit_code;
         }
@@ -1664,15 +1869,19 @@ int run_run_command(const char *filename) {
     char *source = NULL;
     TokenArray tokens = {0};
     StmtArray statements = {0};
+    Environment environment;
+    init_environment(&environment);
     int exit_code = parse_file_to_statements(filename, &source, &tokens, &statements);
     if (exit_code != 0) {
+        free_environment(&environment);
         return exit_code;
     }
 
-    exit_code = interpret_statements(&statements);
+    exit_code = interpret_statements(&statements, &environment);
 
     free_stmt_array(&statements);
     free_token_array(&tokens);
     free(source);
+    free_environment(&environment);
     return exit_code;
 }
