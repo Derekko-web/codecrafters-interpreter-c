@@ -126,6 +126,7 @@ typedef struct StmtArray {
 } StmtArray;
 typedef struct NativeFunction NativeFunction;
 typedef struct ClassObject ClassObject;
+typedef struct ClassMethodEntry ClassMethodEntry;
 typedef struct InstanceObject InstanceObject;
 typedef struct EnvironmentEntry EnvironmentEntry;
 typedef struct Value Value;
@@ -201,6 +202,7 @@ struct Stmt {
         } var;
         struct {
             Token name;
+            StmtArray methods;
         } class_statement;
         struct {
             Token name;
@@ -254,7 +256,16 @@ struct NativeFunction {
 
 struct ClassObject {
     char *name;
+    ClassMethodEntry *methods;
+    size_t method_count;
+    size_t method_capacity;
     size_t ref_count;
+};
+
+struct ClassMethodEntry {
+    char *name;
+    size_t length;
+    Value value;
 };
 
 struct InstanceObject {
@@ -393,7 +404,7 @@ Expr *new_set_expr(Expr *object, Token name, Expr *value);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
-Stmt *new_class_stmt(Token name);
+Stmt *new_class_stmt(Token name, StmtArray methods);
 Stmt *new_function_stmt(Token name, TokenArray parameters, StmtArray body);
 Stmt *new_return_stmt(Token keyword, Expr *value);
 Stmt *new_block_stmt(StmtArray statements);
@@ -454,6 +465,8 @@ void runtime_error(int line, const char *format, ...);
 int find_instance_field(const InstanceObject *instance_object, const char *name, size_t length);
 void set_instance_field(InstanceObject *instance_object, Token name, Value value);
 Value get_instance_field(const InstanceObject *instance_object, Token name, int *had_runtime_error);
+int find_class_method(const ClassObject *class_object, const char *name, size_t length);
+void set_class_method(ClassObject *class_object, Token name, Value value);
 int find_environment_entry(const Environment *environment, const char *name, size_t length);
 void define_variable(Environment *environment, Token name, Value value);
 Value get_resolved_variable(const Environment *environment, size_t distance, Token name, int *had_runtime_error);
@@ -1442,12 +1455,24 @@ Stmt *parse_class_declaration(Parser *parser) {
         return NULL;
     }
 
+    StmtArray methods = {0};
+    while (!parser_check(parser, TOKEN_RIGHT_BRACE) && !parser_is_at_end(parser)) {
+        Stmt *method = parse_function_declaration(parser);
+        if (method == NULL) {
+            free_stmt_array(&methods);
+            return NULL;
+        }
+
+        append_stmt(&methods, method);
+    }
+
     parser_consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' after class body.");
     if (parser->had_error) {
+        free_stmt_array(&methods);
         return NULL;
     }
 
-    return new_class_stmt(name);
+    return new_class_stmt(name, methods);
 }
 
 Stmt *parse_function_declaration(Parser *parser) {
@@ -1932,10 +1957,11 @@ Stmt *new_var_stmt(Token name, Expr *initializer) {
     return stmt;
 }
 
-Stmt *new_class_stmt(Token name) {
+Stmt *new_class_stmt(Token name, StmtArray methods) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_CLASS;
     stmt->as.class_statement.name = name;
+    stmt->as.class_statement.methods = methods;
     return stmt;
 }
 
@@ -2038,6 +2064,7 @@ void free_stmt(Stmt *stmt) {
             free_expr(stmt->as.var.initializer);
             break;
         case STMT_CLASS:
+            free_stmt_array(&stmt->as.class_statement.methods);
             break;
         case STMT_FUNCTION:
             free_token_array(&stmt->as.function.parameters);
@@ -2546,6 +2573,9 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
         case STMT_CLASS:
             resolver_declare(resolver, stmt->as.class_statement.name);
             resolver_define(resolver, stmt->as.class_statement.name);
+            for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
+                resolver_resolve_function(resolver, stmt->as.class_statement.methods.items[i], RESOLVER_FUNCTION_FUNCTION);
+            }
             return;
         case STMT_FUNCTION:
             resolver_declare(resolver, stmt->as.function.name);
@@ -3060,6 +3090,9 @@ Value make_string_value(const char *start, size_t length) {
 ClassObject *new_class_object(const char *name, size_t length) {
     ClassObject *class_object = xmalloc(sizeof(ClassObject));
     class_object->name = copy_string_slice(name, length);
+    class_object->methods = NULL;
+    class_object->method_count = 0;
+    class_object->method_capacity = 0;
     class_object->ref_count = 1;
     return class_object;
 }
@@ -3082,6 +3115,12 @@ void release_class_object(ClassObject *class_object) {
         return;
     }
 
+    for (size_t i = 0; i < class_object->method_count; i++) {
+        free(class_object->methods[i].name);
+        free_value(&class_object->methods[i].value);
+    }
+
+    free(class_object->methods);
     free(class_object->name);
     free(class_object);
 }
@@ -3288,9 +3327,51 @@ Value get_instance_field(const InstanceObject *instance_object, Token name, int 
         return clone_value(instance_object->fields[index].value);
     }
 
+    index = find_class_method(instance_object->class_object, name.start, name.length);
+    if (index >= 0) {
+        return clone_value(instance_object->class_object->methods[index].value);
+    }
+
     runtime_error(name.line, "Undefined property '%.*s'.", (int) name.length, name.start);
     *had_runtime_error = 1;
     return make_nil_value();
+}
+
+int find_class_method(const ClassObject *class_object, const char *name, size_t length) {
+    if (class_object == NULL) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < class_object->method_count; i++) {
+        if (class_object->methods[i].length == length &&
+            strncmp(class_object->methods[i].name, name, length) == 0) {
+            return (int) i;
+        }
+    }
+
+    return -1;
+}
+
+void set_class_method(ClassObject *class_object, Token name, Value value) {
+    int existing_index = find_class_method(class_object, name.start, name.length);
+    Value stored_value = clone_value(value);
+
+    if (existing_index >= 0) {
+        free_value(&class_object->methods[existing_index].value);
+        class_object->methods[existing_index].value = stored_value;
+        return;
+    }
+
+    if (class_object->method_count == class_object->method_capacity) {
+        size_t new_capacity = class_object->method_capacity < 8 ? 8 : class_object->method_capacity * 2;
+        class_object->methods = xrealloc(class_object->methods, new_capacity * sizeof(ClassMethodEntry));
+        class_object->method_capacity = new_capacity;
+    }
+
+    class_object->methods[class_object->method_count].name = copy_string_slice(name.start, name.length);
+    class_object->methods[class_object->method_count].length = name.length;
+    class_object->methods[class_object->method_count].value = stored_value;
+    class_object->method_count++;
 }
 
 int find_environment_entry(const Environment *environment, const char *name, size_t length) {
@@ -3506,6 +3587,12 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
             value = make_class_value(new_class_object(
                 stmt->as.class_statement.name.start,
                 stmt->as.class_statement.name.length));
+            for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
+                const Stmt *method = stmt->as.class_statement.methods.items[i];
+                Value method_value = make_function_value(method, environment);
+                set_class_method(value.as.class_object, method->as.function.name, method_value);
+                free_value(&method_value);
+            }
             define_variable(environment, stmt->as.class_statement.name, value);
             free_value(&value);
             return 0;
