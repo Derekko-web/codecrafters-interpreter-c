@@ -79,7 +79,8 @@ typedef enum {
     EXPR_LOGICAL,
     EXPR_CALL,
     EXPR_GET,
-    EXPR_SET
+    EXPR_SET,
+    EXPR_SUPER
 } ExprType;
 
 typedef enum {
@@ -184,6 +185,12 @@ struct Expr {
             Token name;
             Expr *value;
         } set;
+        struct {
+            Token keyword;
+            Token method;
+            size_t resolved_depth;
+            int is_resolved;
+        } super_expression;
     } as;
 };
 
@@ -320,7 +327,8 @@ typedef enum {
 
 typedef enum {
     RESOLVER_CLASS_NONE,
-    RESOLVER_CLASS_CLASS
+    RESOLVER_CLASS_CLASS,
+    RESOLVER_CLASS_SUBCLASS
 } ResolverClassType;
 
 typedef struct {
@@ -412,6 +420,7 @@ Expr *new_logical_expr(Expr *left, Token operator_token, Expr *right);
 Expr *new_call_expr(Expr *callee, Token paren, ExprArray arguments);
 Expr *new_get_expr(Expr *object, Token name);
 Expr *new_set_expr(Expr *object, Token name, Expr *value);
+Expr *new_super_expr(Token keyword, Token method);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
@@ -447,6 +456,7 @@ void resolver_declare(Resolver *resolver, Token name);
 void resolver_define(Resolver *resolver, Token name);
 void resolver_resolve_local_variable(Resolver *resolver, Expr *expr);
 void resolver_resolve_local_assignment(Resolver *resolver, Expr *expr);
+void resolver_resolve_local_super(Resolver *resolver, Expr *expr);
 void resolver_resolve_function(Resolver *resolver, const Stmt *stmt, ResolverFunctionType function_type);
 void resolver_resolve_expr(Resolver *resolver, Expr *expr);
 void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt);
@@ -1435,6 +1445,21 @@ Expr *parse_primary(Parser *parser) {
         return new_variable_expr(parser_previous(parser));
     }
 
+    if (parser_match(parser, &(TokenType){TOKEN_SUPER}, 1)) {
+        Token keyword = parser_previous(parser);
+        parser_consume(parser, TOKEN_DOT, "Expect '.' after 'super'.");
+        if (parser->had_error) {
+            return NULL;
+        }
+
+        Token method = parser_consume(parser, TOKEN_IDENTIFIER, "Expect superclass method name.");
+        if (parser->had_error) {
+            return NULL;
+        }
+
+        return new_super_expr(keyword, method);
+    }
+
     if (parser_match(parser, &(TokenType){TOKEN_LEFT_PAREN}, 1)) {
         Expr *expression = parse_expression(parser);
         if (expression == NULL) {
@@ -1974,6 +1999,16 @@ Expr *new_set_expr(Expr *object, Token name, Expr *value) {
     return expr;
 }
 
+Expr *new_super_expr(Token keyword, Token method) {
+    Expr *expr = xmalloc(sizeof(Expr));
+    expr->type = EXPR_SUPER;
+    expr->as.super_expression.keyword = keyword;
+    expr->as.super_expression.method = method;
+    expr->as.super_expression.resolved_depth = 0;
+    expr->as.super_expression.is_resolved = 0;
+    return expr;
+}
+
 Stmt *new_expression_stmt(Expr *expression) {
     Stmt *stmt = xmalloc(sizeof(Stmt));
     stmt->type = STMT_EXPRESSION;
@@ -2080,6 +2115,7 @@ void free_expr(Expr *expr) {
             free_expr(expr->as.set.object);
             free_expr(expr->as.set.value);
             break;
+        case EXPR_SUPER:
         case EXPR_VARIABLE:
         case EXPR_LITERAL:
             break;
@@ -2277,6 +2313,9 @@ void print_expr(const Expr *expr) {
             printf(" %.*s ", (int) expr->as.set.name.length, expr->as.set.name.start);
             print_expr(expr->as.set.value);
             printf(")");
+            return;
+        case EXPR_SUPER:
+            printf("(super %.*s)", (int) expr->as.super_expression.method.length, expr->as.super_expression.method.start);
             return;
     }
 }
@@ -2528,6 +2567,20 @@ void resolver_resolve_local_assignment(Resolver *resolver, Expr *expr) {
     expr->as.assign.is_resolved = 0;
 }
 
+void resolver_resolve_local_super(Resolver *resolver, Expr *expr) {
+    for (size_t i = resolver->count; i > 0; i--) {
+        size_t scope_index = i - 1;
+        ResolverScope *scope = &resolver->items[scope_index];
+        if (resolver_find_scope_entry(scope, expr->as.super_expression.keyword.start, expr->as.super_expression.keyword.length) >= 0) {
+            expr->as.super_expression.is_resolved = 1;
+            expr->as.super_expression.resolved_depth = resolver->count - 1 - scope_index;
+            return;
+        }
+    }
+
+    expr->as.super_expression.is_resolved = 0;
+}
+
 void resolver_resolve_function(Resolver *resolver, const Stmt *stmt, ResolverFunctionType function_type) {
     ResolverFunctionType enclosing_function = resolver->current_function;
     resolver->current_function = function_type;
@@ -2597,6 +2650,14 @@ void resolver_resolve_expr(Resolver *resolver, Expr *expr) {
             resolver_resolve_expr(resolver, expr->as.set.object);
             resolver_resolve_expr(resolver, expr->as.set.value);
             return;
+        case EXPR_SUPER:
+            if (resolver->current_class == RESOLVER_CLASS_NONE) {
+                resolver_error(resolver, expr->as.super_expression.keyword, "Can't use 'super' outside of a class.");
+            } else if (resolver->current_class != RESOLVER_CLASS_SUBCLASS) {
+                resolver_error(resolver, expr->as.super_expression.keyword, "Can't use 'super' in a class with no superclass.");
+            }
+            resolver_resolve_local_super(resolver, expr);
+            return;
     }
 }
 
@@ -2620,7 +2681,9 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
         case STMT_CLASS:
             {
                 ResolverClassType enclosing_class = resolver->current_class;
-                resolver->current_class = RESOLVER_CLASS_CLASS;
+                resolver->current_class = stmt->as.class_statement.superclass != NULL
+                    ? RESOLVER_CLASS_SUBCLASS
+                    : RESOLVER_CLASS_CLASS;
 
                 if (stmt->as.class_statement.superclass != NULL &&
                     stmt->as.class_statement.superclass->type == EXPR_VARIABLE &&
@@ -2638,6 +2701,19 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
                 resolver_declare(resolver, stmt->as.class_statement.name);
                 resolver_define(resolver, stmt->as.class_statement.name);
                 resolver_resolve_expr(resolver, stmt->as.class_statement.superclass);
+
+                if (stmt->as.class_statement.superclass != NULL) {
+                    resolver_begin_scope(resolver);
+                    Token super_token = {
+                        .type = TOKEN_SUPER,
+                        .start = "super",
+                        .length = strlen("super"),
+                        .line = stmt->as.class_statement.name.line,
+                        .number = 0,
+                    };
+                    resolver_declare(resolver, super_token);
+                    resolver_define(resolver, super_token);
+                }
 
                 resolver_begin_scope(resolver);
                 Token this_token = {
@@ -2660,6 +2736,9 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
                 }
 
                 resolver_end_scope(resolver);
+                if (stmt->as.class_statement.superclass != NULL) {
+                    resolver_end_scope(resolver);
+                }
                 resolver->current_class = enclosing_class;
             }
             return;
@@ -3131,6 +3210,66 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
             set_instance_field(object.as.instance_object, expr->as.set.name, value);
             free_value(&object);
             return value;
+        }
+        case EXPR_SUPER: {
+            if (!expr->as.super_expression.is_resolved) {
+                runtime_error(expr->as.super_expression.keyword.line, "Undefined variable 'super'.");
+                *had_runtime_error = 1;
+                return make_nil_value();
+            }
+
+            Environment *super_environment = ancestor_environment(environment, expr->as.super_expression.resolved_depth);
+            if (super_environment == NULL) {
+                runtime_error(expr->as.super_expression.keyword.line, "Undefined variable 'super'.");
+                *had_runtime_error = 1;
+                return make_nil_value();
+            }
+
+            int super_index = find_environment_entry(super_environment, "super", strlen("super"));
+            if (super_index < 0) {
+                runtime_error(expr->as.super_expression.keyword.line, "Undefined variable 'super'.");
+                *had_runtime_error = 1;
+                return make_nil_value();
+            }
+
+            Value superclass = clone_value(super_environment->items[super_index].value);
+            Environment *this_environment = ancestor_environment(environment, expr->as.super_expression.resolved_depth - 1);
+            if (this_environment == NULL) {
+                free_value(&superclass);
+                runtime_error(expr->as.super_expression.keyword.line, "Undefined variable 'this'.");
+                *had_runtime_error = 1;
+                return make_nil_value();
+            }
+
+            int this_index = find_environment_entry(this_environment, "this", strlen("this"));
+            if (this_index < 0) {
+                free_value(&superclass);
+                runtime_error(expr->as.super_expression.keyword.line, "Undefined variable 'this'.");
+                *had_runtime_error = 1;
+                return make_nil_value();
+            }
+
+            Value object = clone_value(this_environment->items[this_index].value);
+            const Value *method = find_inherited_class_method(
+                superclass.as.class_object,
+                expr->as.super_expression.method.start,
+                expr->as.super_expression.method.length);
+            if (method == NULL) {
+                free_value(&superclass);
+                free_value(&object);
+                runtime_error(
+                    expr->as.super_expression.method.line,
+                    "Undefined property '%.*s'.",
+                    (int) expr->as.super_expression.method.length,
+                    expr->as.super_expression.method.start);
+                *had_runtime_error = 1;
+                return make_nil_value();
+            }
+
+            Value bound = bind_method(*method, object.as.instance_object);
+            free_value(&superclass);
+            free_value(&object);
+            return bound;
         }
     }
 
@@ -3783,6 +3922,7 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
             {
                 ClassObject *superclass = NULL;
                 Value superclass_value = make_nil_value();
+                Environment *method_environment = environment;
                 if (stmt->as.class_statement.superclass != NULL) {
                     superclass_value = evaluate_expr(stmt->as.class_statement.superclass, environment, &had_runtime_error);
                     if (had_runtime_error) {
@@ -3799,6 +3939,15 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
                     }
 
                     superclass = superclass_value.as.class_object;
+                    method_environment = new_enclosed_environment(environment);
+                    Token super_token = {
+                        .type = TOKEN_SUPER,
+                        .start = "super",
+                        .length = strlen("super"),
+                        .line = stmt->as.class_statement.name.line,
+                        .number = 0,
+                    };
+                    define_variable(method_environment, super_token, superclass_value);
                 }
 
                 value = make_class_value(new_class_object(
@@ -3806,12 +3955,20 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
                     stmt->as.class_statement.name.length,
                     superclass));
                 free_value(&superclass_value);
-            }
-            for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
-                const Stmt *method = stmt->as.class_statement.methods.items[i];
-                Value method_value = make_function_value(method, environment, is_initializer_name(method->as.function.name));
-                set_class_method(value.as.class_object, method->as.function.name, method_value);
-                free_value(&method_value);
+
+                for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
+                    const Stmt *method = stmt->as.class_statement.methods.items[i];
+                    Value method_value = make_function_value(
+                        method,
+                        method_environment,
+                        is_initializer_name(method->as.function.name));
+                    set_class_method(value.as.class_object, method->as.function.name, method_value);
+                    free_value(&method_value);
+                }
+
+                if (method_environment != environment) {
+                    release_environment(method_environment);
+                }
             }
             define_variable(environment, stmt->as.class_statement.name, value);
             free_value(&value);
