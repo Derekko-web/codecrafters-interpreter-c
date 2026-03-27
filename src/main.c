@@ -123,6 +123,7 @@ typedef struct {
         struct {
             const char *start;
             size_t length;
+            int owns_memory;
         } string;
     } as;
 } Value;
@@ -195,6 +196,8 @@ Value make_nil_value(void);
 Value make_boolean_value(int boolean);
 Value make_number_value(double number);
 Value make_string_value(const char *start, size_t length);
+Value concatenate_strings(Value left, Value right);
+void free_value(Value *value);
 int is_truthy(Value value);
 int values_equal(Value left, Value right);
 void print_value(Value value);
@@ -282,6 +285,7 @@ int run_evaluate_command(const char *filename) {
 
     print_value(value);
     printf("\n");
+    free_value(&value);
 
     free_expr(expression);
     free_token_array(&tokens);
@@ -1146,99 +1150,187 @@ Value evaluate_expr(const Expr *expr, int *had_runtime_error) {
         case EXPR_UNARY: {
             Value right = evaluate_expr(expr->as.unary.right, had_runtime_error);
             if (*had_runtime_error) {
+                free_value(&right);
                 return make_nil_value();
             }
 
             switch (expr->as.unary.operator_token.type) {
                 case TOKEN_BANG:
-                    return make_boolean_value(!is_truthy(right));
+                    {
+                        Value result = make_boolean_value(!is_truthy(right));
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_MINUS:
                     if (right.type != VALUE_NUMBER) {
                         fprintf(stderr, "[line %d] Runtime error: Operand must be a number.\n", expr->as.unary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_number_value(-right.as.number);
+                    {
+                        Value result = make_number_value(-right.as.number);
+                        free_value(&right);
+                        return result;
+                    }
                 default:
                     break;
             }
+            free_value(&right);
             break;
         }
         case EXPR_BINARY: {
             Value left = evaluate_expr(expr->as.binary.left, had_runtime_error);
             if (*had_runtime_error) {
+                free_value(&left);
                 return make_nil_value();
             }
 
             Value right = evaluate_expr(expr->as.binary.right, had_runtime_error);
             if (*had_runtime_error) {
+                free_value(&left);
+                free_value(&right);
                 return make_nil_value();
             }
 
             switch (expr->as.binary.operator_token.type) {
                 case TOKEN_BANG_EQUAL:
-                    return make_boolean_value(!values_equal(left, right));
+                    {
+                        Value result = make_boolean_value(!values_equal(left, right));
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_EQUAL_EQUAL:
-                    return make_boolean_value(values_equal(left, right));
+                    {
+                        Value result = make_boolean_value(values_equal(left, right));
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_GREATER:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
                         fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&left);
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_boolean_value(left.as.number > right.as.number);
+                    {
+                        Value result = make_boolean_value(left.as.number > right.as.number);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_GREATER_EQUAL:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
                         fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&left);
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_boolean_value(left.as.number >= right.as.number);
+                    {
+                        Value result = make_boolean_value(left.as.number >= right.as.number);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_LESS:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
                         fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&left);
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_boolean_value(left.as.number < right.as.number);
+                    {
+                        Value result = make_boolean_value(left.as.number < right.as.number);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_LESS_EQUAL:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
                         fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&left);
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_boolean_value(left.as.number <= right.as.number);
+                    {
+                        Value result = make_boolean_value(left.as.number <= right.as.number);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_MINUS:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
                         fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&left);
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_number_value(left.as.number - right.as.number);
+                    {
+                        Value result = make_number_value(left.as.number - right.as.number);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_PLUS:
+                    if (left.type == VALUE_STRING && right.type == VALUE_STRING) {
+                        Value result = concatenate_strings(left, right);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
-                        fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
+                        fprintf(stderr, "[line %d] Runtime error: Operands must be two numbers or two strings.\n", expr->as.binary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&left);
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_number_value(left.as.number + right.as.number);
+                    {
+                        Value result = make_number_value(left.as.number + right.as.number);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_SLASH:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
                         fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&left);
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_number_value(left.as.number / right.as.number);
+                    {
+                        Value result = make_number_value(left.as.number / right.as.number);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 case TOKEN_STAR:
                     if (left.type != VALUE_NUMBER || right.type != VALUE_NUMBER) {
                         fprintf(stderr, "[line %d] Runtime error: Operands must be numbers.\n", expr->as.binary.operator_token.line);
                         *had_runtime_error = 1;
+                        free_value(&left);
+                        free_value(&right);
                         return make_nil_value();
                     }
-                    return make_number_value(left.as.number * right.as.number);
+                    {
+                        Value result = make_number_value(left.as.number * right.as.number);
+                        free_value(&left);
+                        free_value(&right);
+                        return result;
+                    }
                 default:
                     break;
             }
+            free_value(&left);
+            free_value(&right);
             break;
         }
     }
@@ -1274,8 +1366,33 @@ Value make_string_value(const char *start, size_t length) {
         .type = VALUE_STRING,
         .as.string.start = start,
         .as.string.length = length,
+        .as.string.owns_memory = 0,
     };
     return value;
+}
+
+Value concatenate_strings(Value left, Value right) {
+    size_t length = left.as.string.length + right.as.string.length;
+    char *buffer = xmalloc(length + 1);
+    memcpy(buffer, left.as.string.start, left.as.string.length);
+    memcpy(buffer + left.as.string.length, right.as.string.start, right.as.string.length);
+    buffer[length] = '\0';
+
+    Value value = {
+        .type = VALUE_STRING,
+        .as.string.start = buffer,
+        .as.string.length = length,
+        .as.string.owns_memory = 1,
+    };
+    return value;
+}
+
+void free_value(Value *value) {
+    if (value->type == VALUE_STRING && value->as.string.owns_memory) {
+        free((void *) value->as.string.start);
+    }
+
+    *value = make_nil_value();
 }
 
 int is_truthy(Value value) {
