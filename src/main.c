@@ -93,11 +93,17 @@ typedef enum {
 typedef enum {
     STMT_EXPRESSION,
     STMT_PRINT,
-    STMT_VAR
+    STMT_VAR,
+    STMT_BLOCK
 } StmtType;
 
 typedef struct Expr Expr;
 typedef struct Stmt Stmt;
+typedef struct StmtArray {
+    Stmt **items;
+    size_t count;
+    size_t capacity;
+} StmtArray;
 
 struct Expr {
     ExprType type;
@@ -144,6 +150,9 @@ struct Stmt {
             Token name;
             Expr *initializer;
         } var;
+        struct {
+            StmtArray statements;
+        } block;
     } as;
 };
 
@@ -165,12 +174,6 @@ typedef struct {
     size_t length;
     Value value;
 } EnvironmentEntry;
-
-typedef struct {
-    Stmt **items;
-    size_t count;
-    size_t capacity;
-} StmtArray;
 
 typedef struct {
     EnvironmentEntry *items;
@@ -230,6 +233,7 @@ Expr *parse_primary(Parser *parser);
 Stmt *parse_declaration(Parser *parser);
 Stmt *parse_statement(Parser *parser);
 Stmt *parse_var_declaration(Parser *parser);
+Stmt *parse_block_statement(Parser *parser);
 Stmt *parse_print_statement(Parser *parser);
 Stmt *parse_expression_statement(Parser *parser);
 Expr *new_binary_expr(Expr *left, Token operator_token, Expr *right);
@@ -244,6 +248,7 @@ Expr *new_assign_expr(Token name, Expr *value);
 Stmt *new_expression_stmt(Expr *expression);
 Stmt *new_print_stmt(Expr *expression);
 Stmt *new_var_stmt(Token name, Expr *initializer);
+Stmt *new_block_stmt(StmtArray statements);
 void free_expr(Expr *expr);
 void free_stmt(Stmt *stmt);
 int parser_is_at_end(const Parser *parser);
@@ -1041,6 +1046,10 @@ Stmt *parse_declaration(Parser *parser) {
 }
 
 Stmt *parse_statement(Parser *parser) {
+    if (parser_match(parser, &(TokenType){TOKEN_LEFT_BRACE}, 1)) {
+        return parse_block_statement(parser);
+    }
+
     if (parser_match(parser, &(TokenType){TOKEN_PRINT}, 1)) {
         return parse_print_statement(parser);
     }
@@ -1069,6 +1078,32 @@ Stmt *parse_var_declaration(Parser *parser) {
     }
 
     return new_var_stmt(name, initializer);
+}
+
+Stmt *parse_block_statement(Parser *parser) {
+    StmtArray statements = {
+        .items = NULL,
+        .count = 0,
+        .capacity = 0,
+    };
+
+    while (!parser_check(parser, TOKEN_RIGHT_BRACE) && !parser_is_at_end(parser)) {
+        Stmt *statement = parse_declaration(parser);
+        if (statement == NULL) {
+            free_stmt_array(&statements);
+            return NULL;
+        }
+
+        append_stmt(&statements, statement);
+    }
+
+    parser_consume(parser, TOKEN_RIGHT_BRACE, "Expect '}' .");
+    if (parser->had_error) {
+        free_stmt_array(&statements);
+        return NULL;
+    }
+
+    return new_block_stmt(statements);
 }
 
 Stmt *parse_print_statement(Parser *parser) {
@@ -1206,6 +1241,13 @@ Stmt *new_var_stmt(Token name, Expr *initializer) {
     return stmt;
 }
 
+Stmt *new_block_stmt(StmtArray statements) {
+    Stmt *stmt = xmalloc(sizeof(Stmt));
+    stmt->type = STMT_BLOCK;
+    stmt->as.block.statements = statements;
+    return stmt;
+}
+
 void free_expr(Expr *expr) {
     if (expr == NULL) {
         return;
@@ -1247,6 +1289,9 @@ void free_stmt(Stmt *stmt) {
             break;
         case STMT_VAR:
             free_expr(stmt->as.var.initializer);
+            break;
+        case STMT_BLOCK:
+            free_stmt_array(&stmt->as.block.statements);
             break;
     }
 
@@ -1930,6 +1975,8 @@ int interpret_statement(const Stmt *stmt, Environment *environment) {
             define_variable(environment, stmt->as.var.name, value);
             free_value(&value);
             return 0;
+        case STMT_BLOCK:
+            return interpret_statements(&stmt->as.block.statements, environment);
     }
 
     return 70;
