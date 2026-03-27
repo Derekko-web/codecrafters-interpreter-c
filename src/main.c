@@ -236,6 +236,7 @@ struct Environment {
     EnvironmentEntry *items;
     size_t count;
     size_t capacity;
+    size_t ref_count;
     Environment *enclosing;
 };
 
@@ -254,9 +255,10 @@ void append_token(TokenArray *tokens, Token token);
 void append_expr(ExprArray *expressions, Expr *expression);
 void free_stmt_array(StmtArray *statements);
 void append_stmt(StmtArray *statements, Stmt *stmt);
-void init_environment(Environment *environment);
-void init_enclosed_environment(Environment *environment, Environment *enclosing);
-void free_environment(Environment *environment);
+Environment *new_environment(void);
+Environment *new_enclosed_environment(Environment *enclosing);
+Environment *retain_environment(Environment *environment);
+void release_environment(Environment *environment);
 void define_native_functions(Environment *environment);
 void init_scanner(Scanner *scanner, const char *source);
 int scan_tokens(Scanner *scanner);
@@ -443,22 +445,21 @@ int run_evaluate_command(const char *filename) {
     char *source = NULL;
     TokenArray tokens = {0};
     Expr *expression = NULL;
-    Environment environment;
-    init_environment(&environment);
-    define_native_functions(&environment);
+    Environment *environment = new_environment();
+    define_native_functions(environment);
     int exit_code = parse_file_to_expression(filename, &source, &tokens, &expression);
     if (exit_code != 0) {
-        free_environment(&environment);
+        release_environment(environment);
         return exit_code;
     }
 
     int had_runtime_error = 0;
-    Value value = evaluate_expr(expression, &environment, &had_runtime_error);
+    Value value = evaluate_expr(expression, environment, &had_runtime_error);
     if (had_runtime_error) {
         free_expr(expression);
         free_token_array(&tokens);
         free(source);
-        free_environment(&environment);
+        release_environment(environment);
         return 70;
     }
 
@@ -469,7 +470,7 @@ int run_evaluate_command(const char *filename) {
     free_expr(expression);
     free_token_array(&tokens);
     free(source);
-    free_environment(&environment);
+    release_environment(environment);
     return 0;
 }
 
@@ -590,16 +591,28 @@ void append_stmt(StmtArray *statements, Stmt *stmt) {
     statements->items[statements->count++] = stmt;
 }
 
-void init_environment(Environment *environment) {
+Environment *new_environment(void) {
+    Environment *environment = xmalloc(sizeof(Environment));
     environment->items = NULL;
     environment->count = 0;
     environment->capacity = 0;
+    environment->ref_count = 1;
     environment->enclosing = NULL;
+    return environment;
 }
 
-void init_enclosed_environment(Environment *environment, Environment *enclosing) {
-    init_environment(environment);
-    environment->enclosing = enclosing;
+Environment *new_enclosed_environment(Environment *enclosing) {
+    Environment *environment = new_environment();
+    environment->enclosing = retain_environment(enclosing);
+    return environment;
+}
+
+Environment *retain_environment(Environment *environment) {
+    if (environment != NULL) {
+        environment->ref_count++;
+    }
+
+    return environment;
 }
 
 void define_native_functions(Environment *environment) {
@@ -616,17 +629,25 @@ void define_native_functions(Environment *environment) {
     free_value(&clock);
 }
 
-void free_environment(Environment *environment) {
+void release_environment(Environment *environment) {
+    if (environment == NULL) {
+        return;
+    }
+
+    if (environment->ref_count > 1) {
+        environment->ref_count--;
+        return;
+    }
+
     for (size_t i = 0; i < environment->count; i++) {
         free(environment->items[i].name);
         free_value(&environment->items[i].value);
     }
 
     free(environment->items);
-    environment->items = NULL;
-    environment->count = 0;
-    environment->capacity = 0;
-    environment->enclosing = NULL;
+    Environment *enclosing = environment->enclosing;
+    free(environment);
+    release_environment(enclosing);
 }
 
 void init_scanner(Scanner *scanner, const char *source) {
@@ -2402,20 +2423,19 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                     return make_nil_value();
                 }
 
-                Environment function_environment;
-                init_enclosed_environment(&function_environment, callee.as.function.closure);
+                Environment *function_environment = new_enclosed_environment(callee.as.function.closure);
                 for (size_t i = 0; i < declaration->as.function.parameters.count; i++) {
-                    define_variable(&function_environment, declaration->as.function.parameters.items[i], arguments[i]);
+                    define_variable(function_environment, declaration->as.function.parameters.items[i], arguments[i]);
                 }
 
                 int did_return = 0;
                 Value return_value = make_nil_value();
                 int exit_code = interpret_statements(
                     &declaration->as.function.body,
-                    &function_environment,
+                    function_environment,
                     &did_return,
                     &return_value);
-                free_environment(&function_environment);
+                release_environment(function_environment);
                 if (exit_code != 0) {
                     *had_runtime_error = 1;
                     for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
@@ -2490,7 +2510,7 @@ Value make_function_value(const Stmt *declaration, Environment *closure) {
     Value value = {
         .type = VALUE_FUNCTION,
         .as.function.declaration = declaration,
-        .as.function.closure = closure,
+        .as.function.closure = retain_environment(closure),
     };
     return value;
 }
@@ -2548,6 +2568,10 @@ Value concatenate_strings(Value left, Value right) {
 void free_value(Value *value) {
     if (value->type == VALUE_STRING && value->as.string.owns_memory) {
         free((void *) value->as.string.start);
+    }
+
+    if (value->type == VALUE_FUNCTION) {
+        release_environment(value->as.function.closure);
     }
 
     *value = make_nil_value();
@@ -2755,10 +2779,9 @@ int interpret_statement(const Stmt *stmt, Environment *environment, int *did_ret
             *did_return = 1;
             return 0;
         case STMT_BLOCK: {
-            Environment block_environment;
-            init_enclosed_environment(&block_environment, environment);
-            int exit_code = interpret_statements(&stmt->as.block.statements, &block_environment, did_return, return_value);
-            free_environment(&block_environment);
+            Environment *block_environment = new_enclosed_environment(environment);
+            int exit_code = interpret_statements(&stmt->as.block.statements, block_environment, did_return, return_value);
+            release_environment(block_environment);
             return exit_code;
         }
         case STMT_IF:
@@ -2825,23 +2848,22 @@ int run_run_command(const char *filename) {
     char *source = NULL;
     TokenArray tokens = {0};
     StmtArray statements = {0};
-    Environment environment;
-    init_environment(&environment);
-    define_native_functions(&environment);
+    Environment *environment = new_environment();
+    define_native_functions(environment);
     int exit_code = parse_file_to_statements(filename, &source, &tokens, &statements);
     if (exit_code != 0) {
-        free_environment(&environment);
+        release_environment(environment);
         return exit_code;
     }
 
     int did_return = 0;
     Value return_value = make_nil_value();
-    exit_code = interpret_statements(&statements, &environment, &did_return, &return_value);
+    exit_code = interpret_statements(&statements, environment, &did_return, &return_value);
     free_value(&return_value);
 
     free_stmt_array(&statements);
     free_token_array(&tokens);
     free(source);
-    free_environment(&environment);
+    release_environment(environment);
     return exit_code;
 }
