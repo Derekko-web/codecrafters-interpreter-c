@@ -147,10 +147,14 @@ struct Expr {
         } unary;
         struct {
             Token name;
+            size_t resolved_depth;
+            int is_resolved;
         } variable;
         struct {
             Token name;
             Expr *value;
+            size_t resolved_depth;
+            int is_resolved;
         } assign;
         struct {
             Expr *left;
@@ -246,6 +250,31 @@ typedef struct {
     int had_error;
 } Parser;
 
+typedef struct {
+    char *name;
+    size_t length;
+    int is_defined;
+} ResolverScopeEntry;
+
+typedef struct {
+    ResolverScopeEntry *items;
+    size_t count;
+    size_t capacity;
+} ResolverScope;
+
+typedef enum {
+    RESOLVER_FUNCTION_NONE,
+    RESOLVER_FUNCTION_FUNCTION
+} ResolverFunctionType;
+
+typedef struct {
+    ResolverScope *items;
+    size_t count;
+    size_t capacity;
+    int had_error;
+    ResolverFunctionType current_function;
+} Resolver;
+
 char *read_file_contents(const char *filename);
 void *xmalloc(size_t size);
 void *xrealloc(void *pointer, size_t size);
@@ -259,6 +288,8 @@ Environment *new_environment(void);
 Environment *new_enclosed_environment(Environment *enclosing);
 Environment *retain_environment(Environment *environment);
 void release_environment(Environment *environment);
+Environment *ancestor_environment(Environment *environment, size_t distance);
+Environment *global_environment(Environment *environment);
 void define_native_functions(Environment *environment);
 void init_scanner(Scanner *scanner, const char *source);
 int scan_tokens(Scanner *scanner);
@@ -344,6 +375,22 @@ void print_parenthesized(const char *name, size_t name_length, const Expr *const
 int scan_file_to_tokens(const char *filename, char **source_out, TokenArray *tokens_out);
 int parse_file_to_expression(const char *filename, char **source_out, TokenArray *tokens_out, Expr **expression_out);
 int parse_file_to_statements(const char *filename, char **source_out, TokenArray *tokens_out, StmtArray *statements_out);
+void free_resolver_scope(ResolverScope *scope);
+void init_resolver(Resolver *resolver);
+void free_resolver(Resolver *resolver);
+void append_resolver_scope(Resolver *resolver, ResolverScope scope);
+void resolver_begin_scope(Resolver *resolver);
+void resolver_end_scope(Resolver *resolver);
+int resolver_find_scope_entry(const ResolverScope *scope, const char *name, size_t length);
+void resolver_declare(Resolver *resolver, Token name);
+void resolver_define(Resolver *resolver, Token name);
+void resolver_resolve_local_variable(Resolver *resolver, Expr *expr);
+void resolver_resolve_local_assignment(Resolver *resolver, Expr *expr);
+void resolver_resolve_function(Resolver *resolver, const Stmt *stmt, ResolverFunctionType function_type);
+void resolver_resolve_expr(Resolver *resolver, Expr *expr);
+void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt);
+void resolver_resolve_statements(Resolver *resolver, const StmtArray *statements);
+void resolver_error(Resolver *resolver, Token token, const char *message);
 Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime_error);
 Value make_nil_value(void);
 Value make_boolean_value(int boolean);
@@ -359,7 +406,9 @@ Value native_clock(int argument_count, const Value *arguments);
 void runtime_error(int line, const char *format, ...);
 int find_environment_entry(const Environment *environment, const char *name, size_t length);
 void define_variable(Environment *environment, Token name, Value value);
+Value get_resolved_variable(const Environment *environment, size_t distance, Token name, int *had_runtime_error);
 Value get_variable(const Environment *environment, Token name, int *had_runtime_error);
+int assign_resolved_variable(Environment *environment, size_t distance, Token name, Value value, int *had_runtime_error);
 int assign_variable(Environment *environment, Token name, Value value, int *had_runtime_error);
 int is_truthy(Value value);
 int values_equal(Value left, Value right);
@@ -613,6 +662,28 @@ Environment *retain_environment(Environment *environment) {
     }
 
     return environment;
+}
+
+Environment *ancestor_environment(Environment *environment, size_t distance) {
+    Environment *current = environment;
+    for (size_t i = 0; i < distance; i++) {
+        if (current == NULL) {
+            return NULL;
+        }
+
+        current = current->enclosing;
+    }
+
+    return current;
+}
+
+Environment *global_environment(Environment *environment) {
+    Environment *current = environment;
+    while (current != NULL && current->enclosing != NULL) {
+        current = current->enclosing;
+    }
+
+    return current;
 }
 
 void define_native_functions(Environment *environment) {
@@ -1701,6 +1772,8 @@ Expr *new_variable_expr(Token name) {
     Expr *expr = xmalloc(sizeof(Expr));
     expr->type = EXPR_VARIABLE;
     expr->as.variable.name = name;
+    expr->as.variable.resolved_depth = 0;
+    expr->as.variable.is_resolved = 0;
     return expr;
 }
 
@@ -1709,6 +1782,8 @@ Expr *new_assign_expr(Token name, Expr *value) {
     expr->type = EXPR_ASSIGN;
     expr->as.assign.name = name;
     expr->as.assign.value = value;
+    expr->as.assign.resolved_depth = 0;
+    expr->as.assign.is_resolved = 0;
     return expr;
 }
 
@@ -2108,6 +2183,270 @@ int parse_file_to_statements(const char *filename, char **source_out, TokenArray
     return 0;
 }
 
+void free_resolver_scope(ResolverScope *scope) {
+    if (scope == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < scope->count; i++) {
+        free(scope->items[i].name);
+    }
+
+    free(scope->items);
+    scope->items = NULL;
+    scope->count = 0;
+    scope->capacity = 0;
+}
+
+void init_resolver(Resolver *resolver) {
+    resolver->items = NULL;
+    resolver->count = 0;
+    resolver->capacity = 0;
+    resolver->had_error = 0;
+    resolver->current_function = RESOLVER_FUNCTION_NONE;
+}
+
+void free_resolver(Resolver *resolver) {
+    for (size_t i = 0; i < resolver->count; i++) {
+        free_resolver_scope(&resolver->items[i]);
+    }
+
+    free(resolver->items);
+    resolver->items = NULL;
+    resolver->count = 0;
+    resolver->capacity = 0;
+    resolver->had_error = 0;
+    resolver->current_function = RESOLVER_FUNCTION_NONE;
+}
+
+void append_resolver_scope(Resolver *resolver, ResolverScope scope) {
+    if (resolver->count == resolver->capacity) {
+        size_t new_capacity = resolver->capacity < 8 ? 8 : resolver->capacity * 2;
+        resolver->items = xrealloc(resolver->items, new_capacity * sizeof(ResolverScope));
+        resolver->capacity = new_capacity;
+    }
+
+    resolver->items[resolver->count++] = scope;
+}
+
+void resolver_begin_scope(Resolver *resolver) {
+    ResolverScope scope = {
+        .items = NULL,
+        .count = 0,
+        .capacity = 0,
+    };
+    append_resolver_scope(resolver, scope);
+}
+
+void resolver_end_scope(Resolver *resolver) {
+    if (resolver->count == 0) {
+        return;
+    }
+
+    free_resolver_scope(&resolver->items[resolver->count - 1]);
+    resolver->count--;
+}
+
+int resolver_find_scope_entry(const ResolverScope *scope, const char *name, size_t length) {
+    if (scope == NULL) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < scope->count; i++) {
+        if (scope->items[i].length == length &&
+            strncmp(scope->items[i].name, name, length) == 0) {
+            return (int) i;
+        }
+    }
+
+    return -1;
+}
+
+void resolver_declare(Resolver *resolver, Token name) {
+    if (resolver->count == 0) {
+        return;
+    }
+
+    ResolverScope *scope = &resolver->items[resolver->count - 1];
+    if (resolver_find_scope_entry(scope, name.start, name.length) >= 0) {
+        resolver_error(resolver, name, "Already a variable with this name in this scope.");
+        return;
+    }
+
+    if (scope->count == scope->capacity) {
+        size_t new_capacity = scope->capacity < 8 ? 8 : scope->capacity * 2;
+        scope->items = xrealloc(scope->items, new_capacity * sizeof(ResolverScopeEntry));
+        scope->capacity = new_capacity;
+    }
+
+    scope->items[scope->count].name = copy_string_slice(name.start, name.length);
+    scope->items[scope->count].length = name.length;
+    scope->items[scope->count].is_defined = 0;
+    scope->count++;
+}
+
+void resolver_define(Resolver *resolver, Token name) {
+    if (resolver->count == 0) {
+        return;
+    }
+
+    ResolverScope *scope = &resolver->items[resolver->count - 1];
+    int index = resolver_find_scope_entry(scope, name.start, name.length);
+    if (index >= 0) {
+        scope->items[index].is_defined = 1;
+    }
+}
+
+void resolver_resolve_local_variable(Resolver *resolver, Expr *expr) {
+    for (size_t i = resolver->count; i > 0; i--) {
+        size_t scope_index = i - 1;
+        ResolverScope *scope = &resolver->items[scope_index];
+        if (resolver_find_scope_entry(scope, expr->as.variable.name.start, expr->as.variable.name.length) >= 0) {
+            expr->as.variable.is_resolved = 1;
+            expr->as.variable.resolved_depth = resolver->count - 1 - scope_index;
+            return;
+        }
+    }
+
+    expr->as.variable.is_resolved = 0;
+}
+
+void resolver_resolve_local_assignment(Resolver *resolver, Expr *expr) {
+    for (size_t i = resolver->count; i > 0; i--) {
+        size_t scope_index = i - 1;
+        ResolverScope *scope = &resolver->items[scope_index];
+        if (resolver_find_scope_entry(scope, expr->as.assign.name.start, expr->as.assign.name.length) >= 0) {
+            expr->as.assign.is_resolved = 1;
+            expr->as.assign.resolved_depth = resolver->count - 1 - scope_index;
+            return;
+        }
+    }
+
+    expr->as.assign.is_resolved = 0;
+}
+
+void resolver_resolve_function(Resolver *resolver, const Stmt *stmt, ResolverFunctionType function_type) {
+    ResolverFunctionType enclosing_function = resolver->current_function;
+    resolver->current_function = function_type;
+
+    resolver_begin_scope(resolver);
+    for (size_t i = 0; i < stmt->as.function.parameters.count; i++) {
+        Token parameter = stmt->as.function.parameters.items[i];
+        resolver_declare(resolver, parameter);
+        resolver_define(resolver, parameter);
+    }
+    resolver_resolve_statements(resolver, &stmt->as.function.body);
+    resolver_end_scope(resolver);
+
+    resolver->current_function = enclosing_function;
+}
+
+void resolver_resolve_expr(Resolver *resolver, Expr *expr) {
+    if (expr == NULL) {
+        return;
+    }
+
+    switch (expr->type) {
+        case EXPR_BINARY:
+            resolver_resolve_expr(resolver, expr->as.binary.left);
+            resolver_resolve_expr(resolver, expr->as.binary.right);
+            return;
+        case EXPR_GROUPING:
+            resolver_resolve_expr(resolver, expr->as.grouping.expression);
+            return;
+        case EXPR_LITERAL:
+            return;
+        case EXPR_UNARY:
+            resolver_resolve_expr(resolver, expr->as.unary.right);
+            return;
+        case EXPR_VARIABLE:
+            if (resolver->count > 0) {
+                ResolverScope *scope = &resolver->items[resolver->count - 1];
+                int index = resolver_find_scope_entry(scope, expr->as.variable.name.start, expr->as.variable.name.length);
+                if (index >= 0 && !scope->items[index].is_defined) {
+                    resolver_error(resolver, expr->as.variable.name, "Can't read local variable in its own initializer.");
+                }
+            }
+            resolver_resolve_local_variable(resolver, expr);
+            return;
+        case EXPR_ASSIGN:
+            resolver_resolve_expr(resolver, expr->as.assign.value);
+            resolver_resolve_local_assignment(resolver, expr);
+            return;
+        case EXPR_LOGICAL:
+            resolver_resolve_expr(resolver, expr->as.logical.left);
+            resolver_resolve_expr(resolver, expr->as.logical.right);
+            return;
+        case EXPR_CALL:
+            resolver_resolve_expr(resolver, expr->as.call.callee);
+            for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
+                resolver_resolve_expr(resolver, expr->as.call.arguments.items[i]);
+            }
+            return;
+    }
+}
+
+void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
+    if (stmt == NULL) {
+        return;
+    }
+
+    switch (stmt->type) {
+        case STMT_EXPRESSION:
+            resolver_resolve_expr(resolver, stmt->as.expression.expression);
+            return;
+        case STMT_PRINT:
+            resolver_resolve_expr(resolver, stmt->as.print.expression);
+            return;
+        case STMT_VAR:
+            resolver_declare(resolver, stmt->as.var.name);
+            resolver_resolve_expr(resolver, stmt->as.var.initializer);
+            resolver_define(resolver, stmt->as.var.name);
+            return;
+        case STMT_FUNCTION:
+            resolver_declare(resolver, stmt->as.function.name);
+            resolver_define(resolver, stmt->as.function.name);
+            resolver_resolve_function(resolver, stmt, RESOLVER_FUNCTION_FUNCTION);
+            return;
+        case STMT_RETURN:
+            if (resolver->current_function == RESOLVER_FUNCTION_NONE) {
+                resolver_error(resolver, stmt->as.return_statement.keyword, "Can't return from top-level code.");
+            }
+            resolver_resolve_expr(resolver, stmt->as.return_statement.value);
+            return;
+        case STMT_BLOCK:
+            resolver_begin_scope(resolver);
+            resolver_resolve_statements(resolver, &stmt->as.block.statements);
+            resolver_end_scope(resolver);
+            return;
+        case STMT_IF:
+            resolver_resolve_expr(resolver, stmt->as.if_statement.condition);
+            resolver_resolve_statement(resolver, stmt->as.if_statement.then_branch);
+            resolver_resolve_statement(resolver, stmt->as.if_statement.else_branch);
+            return;
+        case STMT_WHILE:
+            resolver_resolve_expr(resolver, stmt->as.while_statement.condition);
+            resolver_resolve_statement(resolver, stmt->as.while_statement.body);
+            return;
+    }
+}
+
+void resolver_resolve_statements(Resolver *resolver, const StmtArray *statements) {
+    for (size_t i = 0; i < statements->count; i++) {
+        resolver_resolve_statement(resolver, statements->items[i]);
+    }
+}
+
+void resolver_error(Resolver *resolver, Token token, const char *message) {
+    if (token.type == TOKEN_EOF) {
+        fprintf(stderr, "[line %d] Error at end: %s\n", token.line, message);
+    } else {
+        fprintf(stderr, "[line %d] Error at '%.*s': %s\n", token.line, (int) token.length, token.start, message);
+    }
+
+    resolver->had_error = 1;
+}
+
 Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime_error) {
     switch (expr->type) {
         case EXPR_LITERAL:
@@ -2311,7 +2650,10 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
             break;
         }
         case EXPR_VARIABLE:
-            return get_variable(environment, expr->as.variable.name, had_runtime_error);
+            if (expr->as.variable.is_resolved) {
+                return get_resolved_variable(environment, expr->as.variable.resolved_depth, expr->as.variable.name, had_runtime_error);
+            }
+            return get_variable(global_environment(environment), expr->as.variable.name, had_runtime_error);
         case EXPR_ASSIGN: {
             Value value = evaluate_expr(expr->as.assign.value, environment, had_runtime_error);
             if (*had_runtime_error) {
@@ -2319,7 +2661,19 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                 return make_nil_value();
             }
 
-            if (!assign_variable(environment, expr->as.assign.name, value, had_runtime_error)) {
+            int did_assign;
+            if (expr->as.assign.is_resolved) {
+                did_assign = assign_resolved_variable(
+                    environment,
+                    expr->as.assign.resolved_depth,
+                    expr->as.assign.name,
+                    value,
+                    had_runtime_error);
+            } else {
+                did_assign = assign_variable(global_environment(environment), expr->as.assign.name, value, had_runtime_error);
+            }
+
+            if (!did_assign) {
                 free_value(&value);
                 return make_nil_value();
             }
@@ -2628,6 +2982,20 @@ void define_variable(Environment *environment, Token name, Value value) {
     environment->count++;
 }
 
+Value get_resolved_variable(const Environment *environment, size_t distance, Token name, int *had_runtime_error) {
+    Environment *target = ancestor_environment((Environment *) environment, distance);
+    if (target != NULL) {
+        int index = find_environment_entry(target, name.start, name.length);
+        if (index >= 0) {
+            return clone_value(target->items[index].value);
+        }
+    }
+
+    runtime_error(name.line, "Undefined variable '%.*s'.", (int) name.length, name.start);
+    *had_runtime_error = 1;
+    return make_nil_value();
+}
+
 Value get_variable(const Environment *environment, Token name, int *had_runtime_error) {
     for (const Environment *current = environment; current != NULL; current = current->enclosing) {
         int index = find_environment_entry(current, name.start, name.length);
@@ -2639,6 +3007,22 @@ Value get_variable(const Environment *environment, Token name, int *had_runtime_
     runtime_error(name.line, "Undefined variable '%.*s'.", (int) name.length, name.start);
     *had_runtime_error = 1;
     return make_nil_value();
+}
+
+int assign_resolved_variable(Environment *environment, size_t distance, Token name, Value value, int *had_runtime_error) {
+    Environment *target = ancestor_environment(environment, distance);
+    if (target != NULL) {
+        int index = find_environment_entry(target, name.start, name.length);
+        if (index >= 0) {
+            free_value(&target->items[index].value);
+            target->items[index].value = clone_value(value);
+            return 1;
+        }
+    }
+
+    runtime_error(name.line, "Undefined variable '%.*s'.", (int) name.length, name.start);
+    *had_runtime_error = 1;
+    return 0;
 }
 
 int assign_variable(Environment *environment, Token name, Value value, int *had_runtime_error) {
@@ -2855,6 +3239,19 @@ int run_run_command(const char *filename) {
         release_environment(environment);
         return exit_code;
     }
+
+    Resolver resolver;
+    init_resolver(&resolver);
+    resolver_resolve_statements(&resolver, &statements);
+    if (resolver.had_error) {
+        free_resolver(&resolver);
+        free_stmt_array(&statements);
+        free_token_array(&tokens);
+        free(source);
+        release_environment(environment);
+        return 65;
+    }
+    free_resolver(&resolver);
 
     int did_return = 0;
     Value return_value = make_nil_value();
