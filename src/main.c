@@ -313,12 +313,18 @@ typedef enum {
     RESOLVER_FUNCTION_FUNCTION
 } ResolverFunctionType;
 
+typedef enum {
+    RESOLVER_CLASS_NONE,
+    RESOLVER_CLASS_CLASS
+} ResolverClassType;
+
 typedef struct {
     ResolverScope *items;
     size_t count;
     size_t capacity;
     int had_error;
     ResolverFunctionType current_function;
+    ResolverClassType current_class;
 } Resolver;
 
 char *read_file_contents(const char *filename);
@@ -456,6 +462,7 @@ void release_instance_object(InstanceObject *instance_object);
 Value make_instance_value(InstanceObject *instance_object);
 Value make_native_function_value(const NativeFunction *native_function);
 Value make_function_value(const Stmt *declaration, Environment *closure);
+Value bind_method(Value method, InstanceObject *instance_object);
 char *copy_string_slice(const char *start, size_t length);
 Value clone_value(Value value);
 Value concatenate_strings(Value left, Value right);
@@ -1406,6 +1413,10 @@ Expr *parse_primary(Parser *parser) {
     }
 
     if (parser_match(parser, &(TokenType){TOKEN_IDENTIFIER}, 1)) {
+        return new_variable_expr(parser_previous(parser));
+    }
+
+    if (parser_match(parser, &(TokenType){TOKEN_THIS}, 1)) {
         return new_variable_expr(parser_previous(parser));
     }
 
@@ -2364,6 +2375,7 @@ void init_resolver(Resolver *resolver) {
     resolver->capacity = 0;
     resolver->had_error = 0;
     resolver->current_function = RESOLVER_FUNCTION_NONE;
+    resolver->current_class = RESOLVER_CLASS_NONE;
 }
 
 void free_resolver(Resolver *resolver) {
@@ -2377,6 +2389,7 @@ void free_resolver(Resolver *resolver) {
     resolver->capacity = 0;
     resolver->had_error = 0;
     resolver->current_function = RESOLVER_FUNCTION_NONE;
+    resolver->current_class = RESOLVER_CLASS_NONE;
 }
 
 void append_resolver_scope(Resolver *resolver, ResolverScope scope) {
@@ -2520,6 +2533,10 @@ void resolver_resolve_expr(Resolver *resolver, Expr *expr) {
             resolver_resolve_expr(resolver, expr->as.unary.right);
             return;
         case EXPR_VARIABLE:
+            if (expr->as.variable.name.type == TOKEN_THIS &&
+                resolver->current_class == RESOLVER_CLASS_NONE) {
+                resolver_error(resolver, expr->as.variable.name, "Can't use 'this' outside of a class.");
+            }
             if (resolver->count > 0) {
                 ResolverScope *scope = &resolver->items[resolver->count - 1];
                 int index = resolver_find_scope_entry(scope, expr->as.variable.name.start, expr->as.variable.name.length);
@@ -2571,10 +2588,30 @@ void resolver_resolve_statement(Resolver *resolver, const Stmt *stmt) {
             resolver_define(resolver, stmt->as.var.name);
             return;
         case STMT_CLASS:
-            resolver_declare(resolver, stmt->as.class_statement.name);
-            resolver_define(resolver, stmt->as.class_statement.name);
-            for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
-                resolver_resolve_function(resolver, stmt->as.class_statement.methods.items[i], RESOLVER_FUNCTION_FUNCTION);
+            {
+                ResolverClassType enclosing_class = resolver->current_class;
+                resolver->current_class = RESOLVER_CLASS_CLASS;
+
+                resolver_declare(resolver, stmt->as.class_statement.name);
+                resolver_define(resolver, stmt->as.class_statement.name);
+
+                resolver_begin_scope(resolver);
+                Token this_token = {
+                    .type = TOKEN_THIS,
+                    .start = "this",
+                    .length = strlen("this"),
+                    .line = stmt->as.class_statement.name.line,
+                    .number = 0,
+                };
+                resolver_declare(resolver, this_token);
+                resolver_define(resolver, this_token);
+
+                for (size_t i = 0; i < stmt->as.class_statement.methods.count; i++) {
+                    resolver_resolve_function(resolver, stmt->as.class_statement.methods.items[i], RESOLVER_FUNCTION_FUNCTION);
+                }
+
+                resolver_end_scope(resolver);
+                resolver->current_class = enclosing_class;
             }
             return;
         case STMT_FUNCTION:
@@ -3196,6 +3233,24 @@ Value make_function_value(const Stmt *declaration, Environment *closure) {
     return value;
 }
 
+Value bind_method(Value method, InstanceObject *instance_object) {
+    Environment *bound_environment = new_enclosed_environment(method.as.function.closure);
+    Token this_token = {
+        .type = TOKEN_THIS,
+        .start = "this",
+        .length = strlen("this"),
+        .line = 0,
+        .number = 0,
+    };
+    Value instance_value = make_instance_value(retain_instance_object(instance_object));
+    define_variable(bound_environment, this_token, instance_value);
+    free_value(&instance_value);
+
+    Value bound_method = make_function_value(method.as.function.declaration, bound_environment);
+    release_environment(bound_environment);
+    return bound_method;
+}
+
 char *copy_string_slice(const char *start, size_t length) {
     char *buffer = xmalloc(length + 1);
     memcpy(buffer, start, length);
@@ -3329,7 +3384,7 @@ Value get_instance_field(const InstanceObject *instance_object, Token name, int 
 
     index = find_class_method(instance_object->class_object, name.start, name.length);
     if (index >= 0) {
-        return clone_value(instance_object->class_object->methods[index].value);
+        return bind_method(instance_object->class_object->methods[index].value, (InstanceObject *) instance_object);
     }
 
     runtime_error(name.line, "Undefined property '%.*s'.", (int) name.length, name.start);
