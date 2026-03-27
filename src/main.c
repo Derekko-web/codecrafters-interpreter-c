@@ -93,6 +93,7 @@ typedef enum {
     VALUE_NUMBER,
     VALUE_STRING,
     VALUE_CLASS,
+    VALUE_INSTANCE,
     VALUE_NATIVE_FUNCTION,
     VALUE_FUNCTION
 } ValueType;
@@ -123,6 +124,7 @@ typedef struct StmtArray {
 } StmtArray;
 typedef struct NativeFunction NativeFunction;
 typedef struct ClassObject ClassObject;
+typedef struct InstanceObject InstanceObject;
 typedef struct Value Value;
 typedef struct Environment Environment;
 
@@ -223,6 +225,7 @@ struct Value {
             int owns_memory;
         } string;
         ClassObject *class_object;
+        InstanceObject *instance_object;
         const NativeFunction *native_function;
         struct {
             const Stmt *declaration;
@@ -239,6 +242,11 @@ struct NativeFunction {
 
 struct ClassObject {
     char *name;
+    size_t ref_count;
+};
+
+struct InstanceObject {
+    ClassObject *class_object;
     size_t ref_count;
 };
 
@@ -414,6 +422,10 @@ ClassObject *new_class_object(const char *name, size_t length);
 ClassObject *retain_class_object(ClassObject *class_object);
 void release_class_object(ClassObject *class_object);
 Value make_class_value(ClassObject *class_object);
+InstanceObject *new_instance_object(ClassObject *class_object);
+InstanceObject *retain_instance_object(InstanceObject *instance_object);
+void release_instance_object(InstanceObject *instance_object);
+Value make_instance_value(InstanceObject *instance_object);
 Value make_native_function_value(const NativeFunction *native_function);
 Value make_function_value(const Stmt *declaration, Environment *closure);
 char *copy_string_slice(const char *start, size_t length);
@@ -2784,7 +2796,9 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
                 }
             }
 
-            if (callee.type != VALUE_NATIVE_FUNCTION && callee.type != VALUE_FUNCTION) {
+            if (callee.type != VALUE_CLASS &&
+                callee.type != VALUE_NATIVE_FUNCTION &&
+                callee.type != VALUE_FUNCTION) {
                 runtime_error(expr->as.call.paren.line, "Can only call functions and classes.");
                 *had_runtime_error = 1;
                 for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
@@ -2796,7 +2810,23 @@ Value evaluate_expr(const Expr *expr, Environment *environment, int *had_runtime
             }
 
             Value result;
-            if (callee.type == VALUE_NATIVE_FUNCTION) {
+            if (callee.type == VALUE_CLASS) {
+                if (expr->as.call.arguments.count != 0) {
+                    runtime_error(
+                        expr->as.call.paren.line,
+                        "Expected 0 arguments but got %zu.",
+                        expr->as.call.arguments.count);
+                    *had_runtime_error = 1;
+                    for (size_t i = 0; i < expr->as.call.arguments.count; i++) {
+                        free_value(&arguments[i]);
+                    }
+                    free(arguments);
+                    free_value(&callee);
+                    return make_nil_value();
+                }
+
+                result = make_instance_value(new_instance_object(callee.as.class_object));
+            } else if (callee.type == VALUE_NATIVE_FUNCTION) {
                 const NativeFunction *native_function = callee.as.native_function;
                 if ((size_t) native_function->arity != expr->as.call.arguments.count) {
                     runtime_error(
@@ -2943,6 +2973,43 @@ Value make_class_value(ClassObject *class_object) {
     return value;
 }
 
+InstanceObject *new_instance_object(ClassObject *class_object) {
+    InstanceObject *instance_object = xmalloc(sizeof(InstanceObject));
+    instance_object->class_object = retain_class_object(class_object);
+    instance_object->ref_count = 1;
+    return instance_object;
+}
+
+InstanceObject *retain_instance_object(InstanceObject *instance_object) {
+    if (instance_object != NULL) {
+        instance_object->ref_count++;
+    }
+
+    return instance_object;
+}
+
+void release_instance_object(InstanceObject *instance_object) {
+    if (instance_object == NULL) {
+        return;
+    }
+
+    if (instance_object->ref_count > 1) {
+        instance_object->ref_count--;
+        return;
+    }
+
+    release_class_object(instance_object->class_object);
+    free(instance_object);
+}
+
+Value make_instance_value(InstanceObject *instance_object) {
+    Value value = {
+        .type = VALUE_INSTANCE,
+        .as.instance_object = instance_object,
+    };
+    return value;
+}
+
 Value make_native_function_value(const NativeFunction *native_function) {
     Value value = {
         .type = VALUE_NATIVE_FUNCTION,
@@ -2987,6 +3054,8 @@ Value clone_value(Value value) {
         }
         case VALUE_CLASS:
             return make_class_value(retain_class_object(value.as.class_object));
+        case VALUE_INSTANCE:
+            return make_instance_value(retain_instance_object(value.as.instance_object));
         case VALUE_NATIVE_FUNCTION:
             return make_native_function_value(value.as.native_function);
         case VALUE_FUNCTION:
@@ -3019,6 +3088,10 @@ void free_value(Value *value) {
 
     if (value->type == VALUE_CLASS) {
         release_class_object(value->as.class_object);
+    }
+
+    if (value->type == VALUE_INSTANCE) {
+        release_instance_object(value->as.instance_object);
     }
 
     if (value->type == VALUE_FUNCTION) {
@@ -3146,6 +3219,7 @@ int is_truthy(Value value) {
         case VALUE_NUMBER:
         case VALUE_STRING:
         case VALUE_CLASS:
+        case VALUE_INSTANCE:
         case VALUE_NATIVE_FUNCTION:
         case VALUE_FUNCTION:
             return 1;
@@ -3171,6 +3245,8 @@ int values_equal(Value left, Value right) {
                    strncmp(left.as.string.start, right.as.string.start, left.as.string.length) == 0;
         case VALUE_CLASS:
             return left.as.class_object == right.as.class_object;
+        case VALUE_INSTANCE:
+            return left.as.instance_object == right.as.instance_object;
         case VALUE_NATIVE_FUNCTION:
             return left.as.native_function == right.as.native_function;
         case VALUE_FUNCTION:
@@ -3200,6 +3276,9 @@ void print_value(Value value) {
             return;
         case VALUE_CLASS:
             printf("%s", value.as.class_object->name);
+            return;
+        case VALUE_INSTANCE:
+            printf("%s instance", value.as.instance_object->class_object->name);
             return;
         case VALUE_NATIVE_FUNCTION:
             printf("<native fn>");
